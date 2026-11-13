@@ -1,0 +1,56 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- ORBIT splash mark (same master, 48-unit viewport) for the static
+     Android splash. Rendered at ~112 dp by launch_background / Android 12
+     splash screen; never stretched full-screen. -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:aapt="http://schemas.android.com/aapt"
+    android:width="48dp"
+    android:height="48dp"
+    android:viewportWidth="48"
+    android:viewportHeight="48">
+
+    <!-- Thin tilted orbit -->
+    <path
+        android:pathData="M 9.08,29.36 A 15.47,6 0 1 0 38.92,18.64"
+        android:strokeColor="#8A8FBC"
+        android:strokeAlpha="0.5"
+        android:strokeWidth="0.38"
+        android:fillColor="#00000000"/>
+
+    <!-- Soft satellite glow (decorative) -->
+    <path
+        android:pathData="M 31.17,15.76 m -4.03,0 a 4.03,4.03 0 1 1 8.06,0 a 4.03,4.03 0 1 1 -8.06,0">
+        <aapt:attr name="android:fillColor">
+            <gradient
+                android:type="radial"
+                android:centerX="31.17"
+                android:centerY="15.76"
+                android:gradientRadius="4.03"
+                android:startColor="#55EAF0FF"
+                android:endColor="#00EAF0FF"/>
+        </aapt:attr>
+    </path>
+
+    <!-- Broken ring with the blue->violet gradient -->
+    <path
+        android:pathData="M 31.61,16.38 A 10.78,10.78 0 1 0 24.0,13.22"
+        android:strokeWidth="2.06"
+        android:strokeLineCap="round"
+        android:fillColor="#00000000">
+        <aapt:attr name="android:strokeColor">
+            <gradient
+                android:type="linear"
+                android:startX="0"
+                android:startY="0"
+                android:endX="48"
+                android:endY="48"
+                android:startColor="#6C8CFF"
+                android:endColor="#9B6CFF"/>
+        </aapt:attr>
+    </path>
+
+    <!-- Satellite -->
+    <path
+        android:fillColor="#EAF0FF"
+        android:pathData="M 31.17,15.76 m -1.41,0 a 1.41,1.41 0 1 1 2.82,0 a 1.41,1.41 0 1 1 -2.82,0"/>
+</vector>

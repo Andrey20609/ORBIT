@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:math' as math;
 
 import 'package:flutter/material.dart';
 import 'package:intl/date_symbol_data_local.dart';
@@ -9,7 +10,6 @@ import 'state/app_state.dart';
 import 'visual_engine/orbit_visual_engine.dart';
 import 'visual_engine/rive_capability.dart';
 import 'widgets/orbit_living_backdrop.dart';
-import 'widgets/orbit_logo.dart';
 import 'widgets/orbit_rive_mark.dart';
 
 final class OrbitBootstrap extends StatefulWidget {
@@ -160,49 +160,115 @@ final class _OrbitBootstrapState extends State<OrbitBootstrap> {
   }
 }
 
-final class _OrbitStartupShell extends StatelessWidget {
+/// STEP5: static startup shell that visually continues the native Android
+/// splash — same #0B1026 background, same centred master mark at ~112 dp.
+/// Fully static by design: no progress indicators, no text, no animation;
+/// the transition to [OrbitVisualLabApp] stays the existing instant switch.
+final class _OrbitStartupShell extends StatefulWidget {
   const _OrbitStartupShell();
+
+  /// Logical size matching the native splash mark (112 dp).
+  static const double markSize = 112;
+
+  @override
+  State<_OrbitStartupShell> createState() => _OrbitStartupShellState();
+}
+
+final class _OrbitStartupShellState extends State<_OrbitStartupShell> {
+  bool _precached = false;
+
+  @override
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+    // Start the mark decode as early as possible so the first Flutter
+    // frames land on the unified #0B1026 background while the image
+    // finishes decoding; no startup timing logic is affected.
+    if (!_precached) {
+      _precached = true;
+      precacheImage(
+        const AssetImage('assets/branding/orbit_splash_mark.png'),
+        context,
+      );
+    }
+  }
 
   @override
   Widget build(BuildContext context) {
-    final palette = OrbitPalette.one;
     return MaterialApp(
       debugShowCheckedModeBanner: false,
-      theme: palette.themeData(palette.accent),
       home: Scaffold(
         key: const Key('orbit-startup-shell'),
-        backgroundColor: palette.skyTop,
+        backgroundColor: const Color(0xFF0B1026),
         body: SafeArea(
           child: Center(
-            child: Column(
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                OrbitLogo(palette: palette, size: 92),
-                const SizedBox(height: 20),
-                Text(
-                  'ORBIT',
-                  style: TextStyle(
-                    color: palette.textPrimary,
-                    fontFamily: 'OrbitSans',
-                    fontSize: 20,
-                    fontWeight: FontWeight.w600,
-                    letterSpacing: 5,
-                  ),
+            child: Image.asset(
+              'assets/branding/orbit_splash_mark.png',
+              width: _OrbitStartupShell.markSize,
+              height: _OrbitStartupShell.markSize,
+              fit: BoxFit.contain,
+              filterQuality: FilterQuality.medium,
+              errorBuilder: (context, error, stackTrace) => SizedBox(
+                width: _OrbitStartupShell.markSize,
+                height: _OrbitStartupShell.markSize,
+                child: CustomPaint(
+                  painter: _StartupMarkFallbackPainter(),
                 ),
-                const SizedBox(height: 22),
-                SizedBox(
-                  width: 24,
-                  height: 24,
-                  child: CircularProgressIndicator(
-                    strokeWidth: 2,
-                    color: palette.accentSecondary,
-                  ),
-                ),
-              ],
+              ),
             ),
           ),
         ),
       ),
     );
   }
+}
+
+/// Minimal vector fallback (same silhouette) used only if the branding
+/// asset fails to load — keeps the first frame on the unified background.
+class _StartupMarkFallbackPainter extends CustomPainter {
+  @override
+  void paint(Canvas canvas, Size size) {
+    final center = Offset(size.width / 2, size.height / 2);
+    final ringRadius = size.width * 0.225;
+    final ringWidth = size.width * 0.043;
+    final paint = Paint()
+      ..style = PaintingStyle.stroke
+      ..strokeWidth = ringWidth
+      ..strokeCap = StrokeCap.round
+      ..shader = const LinearGradient(
+        begin: Alignment.topLeft,
+        end: Alignment.bottomRight,
+        colors: [Color(0xFF6C8CFF), Color(0xFF9B6CFF)],
+      ).createShader(Offset.zero & size);
+    canvas.drawArc(
+      Rect.fromCircle(center: center, radius: ringRadius),
+      -0.5759, // gap start (mirrors the master mark)
+      2 * math.pi - 0.4189, // sweep leaving the 24° gap
+      false,
+      paint,
+    );
+    final orbitPaint = Paint()
+      ..style = PaintingStyle.stroke
+      ..strokeWidth = size.width * 0.0075
+      ..color = const Color(0xFF8A8FBC).withValues(alpha: 0.5);
+    canvas.save();
+    canvas.translate(center.dx, center.dy);
+    canvas.rotate(-24 * math.pi / 180);
+    canvas.drawOval(
+      Rect.fromCenter(
+        center: Offset.zero,
+        width: size.width * 0.6445,
+        height: size.height * 0.25,
+      ),
+      orbitPaint,
+    );
+    canvas.restore();
+    canvas.drawCircle(
+      Offset(size.width * 0.6875, size.height * 0.3482),
+      size.width * 0.0293,
+      Paint()..color = const Color(0xFFEAF0FF),
+    );
+  }
+
+  @override
+  bool shouldRepaint(covariant CustomPainter oldDelegate) => false;
 }

@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- ORBIT monochrome launcher silhouette (Android 13+ themed icons):
+     the same master geometry as a single-colour alpha outline, no gradient,
+     no shadows. -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+
+    <path
+        android:pathData="M 20.42,66.06 A 34.81,13.5 0 1 0 87.58,41.94"
+        android:strokeColor="#FFFFFF"
+        android:strokeAlpha="0.7"
+        android:strokeWidth="0.84"
+        android:fillColor="#00000000"/>
+
+    <path
+        android:pathData="M 71.13,36.86 A 24.25,24.25 0 1 0 54.0,29.74"
+        android:strokeColor="#FFFFFF"
+        android:strokeWidth="4.64"
+        android:strokeLineCap="round"
+        android:fillColor="#00000000"/>
+
+    <path
+        android:fillColor="#FFFFFF"
+        android:pathData="M 70.19,35.46 m -3.16,0 a 3.16,3.16 0 1 1 6.32,0 a 3.16,3.16 0 1 1 -6.32,0"/>
+</vector>

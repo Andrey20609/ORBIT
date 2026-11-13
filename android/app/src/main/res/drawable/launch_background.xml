@@ -1,9 +1,11 @@
 <?xml version="1.0" encoding="utf-8"?>
+<!-- Static ORBIT splash: unified #0B1026 background with the centred
+     master mark at ~112 dp. No animation. -->
 <layer-list xmlns:android="http://schemas.android.com/apk/res/android">
-    <item android:drawable="@color/orbit_splash_background" />
-    <item>
-        <bitmap
-            android:gravity="center"
-            android:src="@drawable/orbit_splash" />
-    </item>
+    <item android:drawable="@color/orbit_splash_background"/>
+    <item
+        android:width="112dp"
+        android:height="112dp"
+        android:gravity="center"
+        android:drawable="@drawable/orbit_splash_mark"/>
 </layer-list>

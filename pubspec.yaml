@@ -1,7 +1,7 @@
 name: orbit_visual_lab
 description: ORBIT — personal digital ecosystem.
 publish_to: none
-version: 0.5.34+40
+version: 0.5.35+41
 
 environment:
   sdk: ">=3.10.0 <4.0.0"
@@ -34,6 +34,7 @@ flutter:
   generate: true
   uses-material-design: true
   assets:
+    - assets/branding/
     - assets/rive/orbit_mark.riv
     - assets/rive/orbit_atmosphere.riv
     - assets/images/

@@ -1,0 +1,41 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  ORBIT launcher/splash master mark.
+  Design DNA: broken ring with a blue-violet gradient, a thin tilted orbit
+  and a single light satellite. No text, no third-party assets.
+  Safe zone: all primary elements stay within the central 682 px of the
+  1024 px canvas (adaptive icon safe area). The glow is decorative only —
+  the silhouette reads without it.
+-->
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024"
+     viewBox="0 0 1024 1024">
+  <defs>
+    <linearGradient id="orbitRingGradient" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#6C8CFF"/>
+      <stop offset="1" stop-color="#9B6CFF"/>
+    </linearGradient>
+    <radialGradient id="satelliteGlow" cx="0.5" cy="0.5" r="0.5">
+      <stop offset="0" stop-color="#EAF0FF" stop-opacity="0.55"/>
+      <stop offset="1" stop-color="#EAF0FF" stop-opacity="0"/>
+    </radialGradient>
+  </defs>
+
+  <!-- Thin tilted orbit (decorative line, subtle) -->
+  <ellipse cx="512" cy="512" rx="330" ry="128"
+           transform="rotate(-24 512 512)"
+           fill="none" stroke="#8A8FBC" stroke-opacity="0.5"
+           stroke-width="8"/>
+
+  <!-- Soft glow behind the satellite (decorative) -->
+  <circle cx="665.6" cy="336.2" r="86" fill="url(#satelliteGlow)"/>
+
+  <!-- Broken ring: one stroke arc with a 24° gap centred at -45°
+       (upper-right), rounded caps, blue→violet gradient -->
+  <path d="M 674.5 349.5
+           A 230 230 0 1 0 512 282"
+        fill="none" stroke="url(#orbitRingGradient)"
+        stroke-width="44" stroke-linecap="round"/>
+
+  <!-- Satellite: one small light body sitting in the ring gap -->
+  <circle cx="665.6" cy="336.2" r="30" fill="#EAF0FF"/>
+</svg>

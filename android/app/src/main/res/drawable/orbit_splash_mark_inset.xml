@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Android 12+ splash renders the icon inside a ~192 dp circle at a
+     larger scale than the pre-12 splash; the inset keeps the master mark
+     fully inside that circle at roughly the agreed ~112 dp size. -->
+<inset xmlns:android="http://schemas.android.com/apk/res/android"
+    android:drawable="@drawable/orbit_splash_mark"
+    android:insetLeft="30%"
+    android:insetTop="30%"
+    android:insetRight="30%"
+    android:insetBottom="30%"/>
