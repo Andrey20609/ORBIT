@@ -41,6 +41,13 @@ final class DriftLocalStateRepository
   /// Identity of the single snapshot row.
   static const int snapshotRowId = 1;
 
+  /// STEP3 migration marker: mailAccounts/sentEmails relational backfill.
+  static const String mailMigrationMarker = 'mail_relational_v1';
+
+  /// Folders owned by the STEP3 sent projection. Rows with other folders
+  /// (future inbox/archive imports) are never touched by this repository.
+  static const List<String> _ownedSentFolders = <String>['sent', 'trash'];
+
   /// Fallback ARGB color for relational events that have no snapshot entry
   /// (production never creates those; OrbitDataEngine writes alone would).
   static const int _fallbackEventColor = 0xFF4285F4;
@@ -55,6 +62,11 @@ final class DriftLocalStateRepository
   bool failNextSaveMidTransaction = false;
 
   bool _migrationAttempted = false;
+
+  /// STEP3: concurrent loads serialize on one chain so a migration started
+  /// by the first caller finishes before the others read the snapshot
+  /// (no empty-state races, no duplicate backfills).
+  Future<void> _loadJob = Future<void>.value();
 
   Future<DriftOrbitDatabase> get _store async {
     final existing = _db ?? _injectedDb;
@@ -78,7 +90,18 @@ final class DriftLocalStateRepository
   }
 
   @override
-  Future<Map<String, Object?>> load() async {
+  Future<Map<String, Object?>> load() {
+    final job = _loadJob.then((_) => _loadInternal());
+    // Keep the chain alive even when a load fails (corrupt data surfaces to
+    // every waiter through its own job).
+    _loadJob = job.then(
+      (_) {},
+      onError: (Object _) {},
+    );
+    return job;
+  }
+
+  Future<Map<String, Object?>> _loadInternal() async {
     final db = await _store;
     var snapshot = await _readSnapshotPayload(db);
     if (snapshot == null) {
@@ -91,7 +114,87 @@ final class DriftLocalStateRepository
         return <String, Object?>{};
       }
     }
-    return _composeState(db, snapshot);
+    final decoded = _decodeSnapshot(snapshot);
+    // STEP3: first open of a STEP2-era database backfills the relational
+    // mail projection and stamps the marker in one transaction.
+    final backfilled = await _ensureMailRelationalBackfill(db, decoded);
+    if (backfilled == null) {
+      // Genuinely empty state stays empty (no synthetic keys).
+      return <String, Object?>{};
+    }
+    return await _composeState(db, backfilled);
+  }
+
+  Map<String, Object?> _decodeSnapshot(String payloadJson) {
+    final decoded = jsonDecode(payloadJson);
+    if (decoded is! Map<String, Object?>) {
+      throw const FormatException('ORBIT state snapshot must be a JSON object');
+    }
+    OrbitLocalStateCodec.validate(decoded);
+    return decoded;
+  }
+
+  /// Runs the one-time [mailMigrationMarker] backfill. Returns the decoded
+  /// state, or null when the snapshot is genuinely empty. The whole
+  /// backfill — snapshot read, decode, projection, marker — happens in a
+  /// single Drift transaction: any error rolls everything back.
+  Future<Map<String, Object?>?> _ensureMailRelationalBackfill(
+    DriftOrbitDatabase db,
+    Map<String, Object?> decoded,
+  ) async {
+    final marker = await _readMailMarker(db);
+    if (marker != null) {
+      return decoded;
+    }
+    final result = await db.transaction((_) async {
+      // Re-read the snapshot inside the transaction per the step contract.
+      final rows = await db.query(
+        snapshotTableName,
+        where: 'id = ?',
+        whereArgs: [snapshotRowId],
+        limit: 1,
+      );
+      if (rows.isEmpty) {
+        return null;
+      }
+      final payload = rows.single['payload_json'] as String?;
+      final state = payload == null ? null : _decodeSnapshot(payload);
+      if (state == null || state.isEmpty) {
+        // Nothing to project; the marker still marks the backfill as done
+        // so an empty-but-valid mail state never triggers it again.
+        await _writeMailMarker(db);
+        return state;
+      }
+      final accountRows = _accountEntriesOf(state);
+      final sentRows = _sentEntriesOf(state);
+      for (final row in accountRows) {
+        await db.insert(OrbitDatabaseSchema.tableAccounts, row);
+      }
+      for (final row in sentRows) {
+        await db.insert(OrbitDatabaseSchema.tableEmails, row);
+      }
+      await _writeMailMarker(db);
+      return state;
+    });
+    return result ?? decoded;
+  }
+
+  Future<int?> _readMailMarker(DriftOrbitDatabase db) async {
+    final rows = await db.query(
+      migrationsTableName,
+      where: 'name = ?',
+      whereArgs: [mailMigrationMarker],
+      limit: 1,
+    );
+    if (rows.isEmpty) return null;
+    return (rows.single['applied_at'] as num?)?.toInt();
+  }
+
+  Future<void> _writeMailMarker(DriftOrbitDatabase db) async {
+    await db.insert(migrationsTableName, {
+      'name': mailMigrationMarker,
+      'applied_at': DateTime.now().millisecondsSinceEpoch,
+    });
   }
 
   Future<String?> _readSnapshotPayload(DriftOrbitDatabase db) async {
@@ -118,17 +221,11 @@ final class DriftLocalStateRepository
   }
 
   /// Builds the returned state: full snapshot payload with `tasks`/`events`
-  /// refreshed from the relational tables.
+  /// and the STEP3 mail projection refreshed from the relational tables.
   Future<Map<String, Object?>> _composeState(
     DriftOrbitDatabase db,
-    String payloadJson,
+    Map<String, Object?> decoded,
   ) async {
-    final decoded = jsonDecode(payloadJson);
-    if (decoded is! Map<String, Object?>) {
-      throw const FormatException('ORBIT state snapshot must be a JSON object');
-    }
-    OrbitLocalStateCodec.validate(decoded);
-
     final relationalTasks = await db.query(
       OrbitDatabaseSchema.tableTasks,
       where: 'workspace_id = ?',
@@ -139,14 +236,39 @@ final class DriftLocalStateRepository
       where: 'workspace_id = ?',
       whereArgs: [defaultWorkspaceId],
     );
+    final relationalAccounts = await db.query(
+      OrbitDatabaseSchema.tableAccounts,
+      where: 'workspace_id = ?',
+      whereArgs: [defaultWorkspaceId],
+      orderBy: 'id ASC',
+    );
+    final relationalMail = await db.query(
+      OrbitDatabaseSchema.tableEmails,
+      where: 'workspace_id = ? AND folder IN (?, ?)',
+      whereArgs: [defaultWorkspaceId, ..._ownedSentFolders],
+      orderBy: 'timestamp ASC, id ASC',
+    );
 
     // A genuinely empty state (empty legacy JSON migration) stays empty:
     // no synthetic tasks/events keys are injected.
-    if (decoded.isEmpty && relationalTasks.isEmpty && relationalEvents.isEmpty) {
+    if (decoded.isEmpty &&
+        relationalTasks.isEmpty &&
+        relationalEvents.isEmpty &&
+        relationalAccounts.isEmpty &&
+        relationalMail.isEmpty) {
       return decoded;
     }
     decoded['tasks'] = _mergeTasks(decoded['tasks'], relationalTasks);
     decoded['events'] = _mergeEvents(decoded['events'], relationalEvents);
+    decoded['mailAccounts'] = _mergeAccounts(
+      decoded['mailAccounts'],
+      relationalAccounts,
+    );
+    decoded['sentEmails'] = _mergeSentEmails(
+      decoded['sentEmails'],
+      relationalMail,
+    );
+    decoded['trashEmails'] = _syncTrashSet(decoded['trashEmails'], relationalMail);
     return decoded;
   }
 
@@ -389,6 +511,52 @@ final class DriftLocalStateRepository
           );
         }
       }
+
+      // 5. STEP3 mail projection: accounts + sent/trash emails.
+      final accountRows = _accountEntriesOf(state);
+      for (final row in accountRows) {
+        await db.insert(OrbitDatabaseSchema.tableAccounts, row);
+      }
+      final sentRows = _sentEntriesOf(state);
+      for (final row in sentRows) {
+        await db.insert(OrbitDatabaseSchema.tableEmails, row);
+      }
+
+      // 6. Scoped sync deletions for the mail projection: only rows of the
+      // sent/trash projection disappear; other email folders stay.
+      final keepAccountIds = accountRows.map((e) => e['id']).toSet();
+      for (final row in await db.query(
+        OrbitDatabaseSchema.tableAccounts,
+        where: 'workspace_id = ?',
+        whereArgs: [defaultWorkspaceId],
+      )) {
+        final id = row['id'];
+        if (id is String && !keepAccountIds.contains(id)) {
+          await db.delete(
+            OrbitDatabaseSchema.tableAccounts,
+            where: 'id = ?',
+            whereArgs: [id],
+          );
+        }
+      }
+      final keepMailIds = sentRows.map((e) => e['id']).toSet();
+      for (final row in await db.query(
+        OrbitDatabaseSchema.tableEmails,
+        where: 'workspace_id = ? AND folder IN (?, ?)',
+        whereArgs: [defaultWorkspaceId, ..._ownedSentFolders],
+      )) {
+        final id = row['id'];
+        if (id is String && !keepMailIds.contains(id)) {
+          await db.delete(
+            OrbitDatabaseSchema.tableEmails,
+            where: 'id = ?',
+            whereArgs: [id],
+          );
+        }
+      }
+
+      // 7. Stamp the STEP3 marker atomically with everything above.
+      await _writeMailMarker(db);
     });
   }
 
@@ -457,6 +625,276 @@ final class DriftLocalStateRepository
     return entries;
   }
 
+  /// STEP3 mapping: state['mailAccounts'] → accounts rows. All values are
+  /// bound as SQL parameters; the map only names allowlisted columns.
+  /// An invalid non-empty `lastVerifiedAtIso` throws (explicit error and
+  /// rollback), it is never silently replaced by the current time.
+  List<Map<String, Object?>> _accountEntriesOf(Map<String, Object?> state) {
+    final raw = state['mailAccounts'];
+    if (raw is! List<Object?>) return const <Map<String, Object?>>[];
+    final entries = <Map<String, Object?>>[];
+    for (final item in raw) {
+      if (item is! Map<String, Object?>) continue;
+      final lastIso = item['lastVerifiedAtIso'] as String?;
+      int? lastSyncAt;
+      if (lastIso != null) {
+        final parsed = DateTime.tryParse(lastIso);
+        if (parsed == null) {
+          throw FormatException(
+            'mailAccounts.lastVerifiedAtIso must be a valid ISO-8601 string',
+          );
+        }
+        lastSyncAt = parsed.millisecondsSinceEpoch;
+      }
+      entries.add(<String, Object?>{
+        'id': item['id']! as String,
+        'workspace_id': defaultWorkspaceId,
+        'email': item['email']! as String,
+        'display_name': item['name']! as String,
+        'provider_type': (item['providerType'] as String?) ?? 'custom',
+        'sync_status': (item['status'] as String?) ?? 'unverified',
+        'last_sync_at': lastSyncAt,
+      });
+    }
+    return entries;
+  }
+
+  /// STEP3 mapping: state['sentEmails'] → emails rows of the sent/trash
+  /// projection. An invalid `sentAtIso` throws (explicit error and
+  /// rollback), it is never silently replaced by the current time.
+  List<Map<String, Object?>> _sentEntriesOf(Map<String, Object?> state) {
+    final raw = state['sentEmails'];
+    if (raw is! List<Object?>) return const <Map<String, Object?>>[];
+    final trashSet = _stringSetOf(state['trashEmails']);
+    Map<String, Object?>? activeAccount;
+    for (final item in (state['mailAccounts'] as List<Object?>? ?? const [])) {
+      if (item is Map<String, Object?> && item['isActive'] == true) {
+        activeAccount = item;
+        break;
+      }
+    }
+    final activeId = activeAccount?['id'] as String?;
+    final activeEmail = activeAccount?['email'] as String?;
+    final entries = <Map<String, Object?>>[];
+    for (final item in raw) {
+      if (item is! Map<String, Object?>) continue;
+      final sentIso = item['sentAtIso'] as String?;
+      final parsed = sentIso == null ? null : DateTime.tryParse(sentIso);
+      if (sentIso != null && parsed == null) {
+        throw FormatException(
+          'sentEmails.sentAtIso must be a valid ISO-8601 string',
+        );
+      }
+      final id = item['id']! as String;
+      final body = (item['body'] as String?) ?? '';
+      entries.add(<String, Object?>{
+        'id': id,
+        'workspace_id': defaultWorkspaceId,
+        'account_id': activeId,
+        'folder': trashSet.contains(id) ? 'trash' : 'sent',
+        'sender': activeEmail ?? '',
+        'recipient': (item['recipient'] as String?) ?? '',
+        'subject': (item['subject'] as String?) ?? 'Без темы',
+        'preview': body,
+        'body': body,
+        'timestamp': parsed?.millisecondsSinceEpoch ?? 0,
+        'is_read': 1,
+        'is_flagged': ((item['isImportant'] as bool?) ?? false) ? 1 : 0,
+        'has_attachments': 0,
+      });
+    }
+    return entries;
+  }
+
+  static Set<String> _stringSetOf(Object? raw) {
+    if (raw is! List<Object?>) return <String>{};
+    return <String>{for (final item in raw) if (item is String) item};
+  }
+
+  /// STEP3 merge: relational accounts own the composition of the
+  /// mailAccounts list. Snapshot order is kept for known ids; relational
+  /// rows unknown to the snapshot follow in deterministic (id ASC) order.
+  /// Snapshot-only decorations (hosts, ports, SSL flags, latency, isActive,
+  /// isDemo, lastError and any future fields) survive the merge.
+  static List<Object?> _mergeAccounts(
+    Object? snapshotAccounts,
+    List<Map<String, Object?>> rows,
+  ) {
+    final byId = <String, Map<String, Object?>>{
+      for (final row in rows)
+        if (row['id'] is String) row['id']! as String: row,
+    };
+    final merged = <Object?>[];
+    final seen = <String>{};
+    if (snapshotAccounts is List<Object?>) {
+      for (final item in snapshotAccounts) {
+        if (item is! Map<String, Object?>) continue;
+        final id = item['id'];
+        final row = id is String ? byId[id] : null;
+        if (row != null) {
+          merged.add(_mergeAccount(item, row));
+          seen.add(id as String);
+        } else {
+          // Not in the relational projection anymore: dropped by the user.
+          continue;
+        }
+      }
+    }
+    for (final entry in byId.entries) {
+      if (!seen.contains(entry.key)) {
+        merged.add(_accountRowToLegacy(entry.value));
+      }
+    }
+    return merged;
+  }
+
+  static Map<String, Object?> _mergeAccount(
+    Map<String, Object?> snapshotEntry,
+    Map<String, Object?> row,
+  ) {
+    final merged = <String, Object?>{...snapshotEntry};
+    if (row['id'] is String) merged['id'] = row['id'];
+    if (row['display_name'] is String) merged['name'] = row['display_name'];
+    if (row['email'] is String) merged['email'] = row['email'];
+    if (row['provider_type'] is String) {
+      merged['providerType'] = row['provider_type'];
+    }
+    if (row['sync_status'] is String) merged['status'] = row['sync_status'];
+    final lastSyncAt = row['last_sync_at'];
+    // Preserve the snapshot's original ISO representation when it exists
+    // (round trip never rewrites time strings); only a snapshot entry
+    // without the key adopts the relational-derived ISO string.
+    if (!snapshotEntry.containsKey('lastVerifiedAtIso')) {
+      merged['lastVerifiedAtIso'] = lastSyncAt is num && lastSyncAt.toInt() > 0
+          ? DateTime.fromMillisecondsSinceEpoch(
+              lastSyncAt.toInt(),
+            ).toIso8601String()
+          : null;
+    } else if (lastSyncAt == null) {
+      merged['lastVerifiedAtIso'] = null;
+    }
+    return merged;
+  }
+
+  static Map<String, Object?> _accountRowToLegacy(Map<String, Object?> row) {
+    final lastSyncAt = row['last_sync_at'];
+    final lastMs = lastSyncAt is num ? lastSyncAt.toInt() : 0;
+    return <String, Object?>{
+      'id': row['id'],
+      'name': row['display_name'],
+      'email': row['email'],
+      'providerType': row['provider_type'],
+      'incomingHost': '',
+      'incomingPort': 993,
+      'useIncomingSsl': true,
+      'outgoingHost': '',
+      'outgoingPort': 465,
+      'useOutgoingSsl': true,
+      'lastVerifiedAtIso': lastMs > 0
+          ? DateTime.fromMillisecondsSinceEpoch(lastMs).toIso8601String()
+          : null,
+      'lastLatencyMs': null,
+      'isActive': false,
+      'status': row['sync_status'],
+      'isDemo': false,
+    };
+  }
+
+  /// STEP3 merge: relational sent/trash rows own the composition of the
+  /// sentEmails list (no resurrection of user-deleted entries). Snapshot
+  /// order is preserved for known ids; relational-only rows follow in
+  /// deterministic (timestamp ASC, id ASC) order with safe fromJson
+  /// defaults. The original `sentAtIso` string of a known snapshot entry is
+  /// kept so a round trip never rewrites the time representation.
+  static List<Object?> _mergeSentEmails(
+    Object? snapshotSent,
+    List<Map<String, Object?>> rows,
+  ) {
+    final byId = <String, Map<String, Object?>>{
+      for (final row in rows)
+        if (row['id'] is String) row['id']! as String: row,
+    };
+    final merged = <Object?>[];
+    final seen = <String>{};
+    if (snapshotSent is List<Object?>) {
+      for (final item in snapshotSent) {
+        if (item is! Map<String, Object?>) continue;
+        final id = item['id'];
+        final row = id is String ? byId[id] : null;
+        if (row != null) {
+          merged.add(_mergeSentEmail(item, row));
+          seen.add(id as String);
+        }
+        // Not in the relational projection: deleted by the user — skip.
+      }
+    }
+    for (final entry in byId.entries) {
+      if (!seen.contains(entry.key)) {
+        merged.add(_sentRowToLegacy(entry.value));
+      }
+    }
+    return merged;
+  }
+
+  static Map<String, Object?> _mergeSentEmail(
+    Map<String, Object?> snapshotEntry,
+    Map<String, Object?> row,
+  ) {
+    final merged = <String, Object?>{...snapshotEntry};
+    if (row['id'] is String) merged['id'] = row['id'];
+    if (row['recipient'] is String) merged['recipient'] = row['recipient'];
+    if (row['subject'] is String) merged['subject'] = row['subject'];
+    if (row['body'] is String) merged['body'] = row['body'];
+    if (row['is_flagged'] is num) {
+      merged['isImportant'] = (row['is_flagged'] as num).toInt() == 1;
+    }
+    // sentAtIso keeps its snapshot representation; only a relational row
+    // without a snapshot entry derives the string from the timestamp.
+    return merged;
+  }
+
+  static Map<String, Object?> _sentRowToLegacy(Map<String, Object?> row) {
+    final timestamp = row['timestamp'];
+    final ms = timestamp is num ? timestamp.toInt() : 0;
+    final body = row['body'];
+    return <String, Object?>{
+      'id': row['id'],
+      'recipient': row['recipient'],
+      'subject': row['subject'],
+      'body': body is String ? body : '',
+      'sentAtIso': ms > 0
+          ? DateTime.fromMillisecondsSinceEpoch(ms).toIso8601String()
+          : DateTime.fromMillisecondsSinceEpoch(0).toIso8601String(),
+      'isImportant': row['is_flagged'] is num
+          ? (row['is_flagged'] as num).toInt() == 1
+          : false,
+    };
+  }
+
+  /// Keeps the trashEmails id set in sync with the relational folder of the
+  /// sent projection so Sent/Trash semantics never drift from SQLite.
+  static List<Object?> _syncTrashSet(
+    Object? snapshotTrash,
+    List<Map<String, Object?>> rows,
+  ) {
+    final result = snapshotTrash is List<Object?>
+        ? <Object?>[...snapshotTrash]
+        : <Object?>[];
+    for (final row in rows) {
+      final id = row['id'];
+      if (id is! String) continue;
+      final isTrash = row['folder'] == 'trash';
+      final present = result.contains(id);
+      if (isTrash && !present) {
+        result.add(id);
+      } else if (!isTrash && present) {
+        result.remove(id);
+      }
+    }
+    result.sort();
+    return result;
+  }
+
   @override
   Future<void> resetCorruptData() async {
     final db = await _store;
@@ -470,6 +908,22 @@ final class DriftLocalStateRepository
       );
       await db.delete(OrbitDatabaseSchema.tableTasks);
       await db.delete(OrbitDatabaseSchema.tableEvents);
+      // STEP3: clear the mail projection and its marker (Drift-only).
+      await db.delete(
+        OrbitDatabaseSchema.tableAccounts,
+        where: 'workspace_id = ?',
+        whereArgs: [defaultWorkspaceId],
+      );
+      await db.delete(
+        OrbitDatabaseSchema.tableEmails,
+        where: 'workspace_id = ? AND folder IN (?, ?)',
+        whereArgs: [defaultWorkspaceId, ..._ownedSentFolders],
+      );
+      await db.delete(
+        migrationsTableName,
+        where: 'name = ?',
+        whereArgs: [mailMigrationMarker],
+      );
     });
     _migrationAttempted = false;
   }

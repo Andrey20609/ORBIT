@@ -50,6 +50,7 @@ final class DriftOrbitDatabase implements OrbitDatabase {
       OrbitDatabaseSchema.tableContacts,
       OrbitDatabaseSchema.tableFiles,
       snapshotTableName,
+      migrationsTableName,
     };
     if (!known.contains(table)) {
       throw ArgumentError.value(table, 'table', 'Unknown ORBIT table');
@@ -148,6 +149,7 @@ final class DriftOrbitDatabase implements OrbitDatabase {
       'updated_at',
     },
     snapshotTableName: {'id', 'payload_json', 'updated_at'},
+    migrationsTableName: {'name', 'applied_at'},
   };
 
   static final RegExp _identifierInText = RegExp(r'[A-Za-z_][A-Za-z0-9_]*');
@@ -423,6 +425,16 @@ const String createSnapshotTable = '''
   );
 ''';
 
+/// STEP3: Drift-only migration marker table. A row here means the named
+/// backfill already ran, even when the target business tables are empty.
+const String migrationsTableName = 'app_state_migrations';
+const String createMigrationsTable = '''
+  CREATE TABLE IF NOT EXISTS app_state_migrations (
+    name TEXT PRIMARY KEY,
+    applied_at INTEGER NOT NULL
+  );
+''';
+
 /// Thin [GeneratedDatabase] shell that owns the connection, creates the
 /// existing ORBIT SQL schema verbatim and seeds default workspaces the same
 /// way [MemoryOrbitDatabase] does.
@@ -444,6 +456,7 @@ final class _OrbitDriftCore extends GeneratedDatabase {
   Future<void> doOpen() async {
     await customStatement('PRAGMA foreign_keys = ON');
     await customStatement(createSnapshotTable);
+    await customStatement(createMigrationsTable);
   }
 
   @override
@@ -451,6 +464,7 @@ final class _OrbitDriftCore extends GeneratedDatabase {
     onCreate: (migrator) async {
       for (final statement in <String>[
         createSnapshotTable,
+        createMigrationsTable,
         OrbitDatabaseSchema.createWorkspaces,
         OrbitDatabaseSchema.createAccounts,
         OrbitDatabaseSchema.createEmails,
