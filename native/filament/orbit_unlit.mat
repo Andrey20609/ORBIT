@@ -1,0 +1,15 @@
+material {
+    name : OrbitAtmosphere,
+    shadingModel : unlit,
+    blending : transparent,
+    doubleSided : true,
+    parameters : [
+        { type : float4, name : baseColor }
+    ],
+}
+fragment {
+    void material(inout MaterialInputs material) {
+        prepareMaterial(material);
+        material.baseColor = materialParams.baseColor;
+    }
+}

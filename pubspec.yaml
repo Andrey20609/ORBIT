@@ -1,0 +1,50 @@
+name: orbit_visual_lab
+description: ORBIT — personal digital ecosystem.
+publish_to: none
+version: 0.5.30+36
+
+environment:
+  sdk: ">=3.10.0 <4.0.0"
+
+dependencies:
+  flutter:
+    sdk: flutter
+  flutter_localizations:
+    sdk: flutter
+  go_router: ^18.1.2
+  clock: ^1.1.2
+  shared_preferences: ^2.5.6
+  flutter_secure_storage: ^9.2.4
+  rive: 0.14.11
+  intl: ^0.20.3
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  integration_test:
+    sdk: flutter
+  flutter_lints: ^6.0.0
+
+flutter:
+  generate: true
+  uses-material-design: true
+  assets:
+    - assets/rive/orbit_mark.riv
+    - assets/rive/orbit_atmosphere.riv
+    - assets/images/
+    - assets/photoreal/optimized/
+  shaders:
+    - shaders/optical_glass.frag
+  fonts:
+    - family: OrbitSans
+      fonts:
+        - asset: assets/fonts/OrbitSans-Regular.ttf
+        - asset: assets/fonts/OrbitSans-Medium.ttf
+          weight: 500
+        - asset: assets/fonts/OrbitSans-SemiBold.ttf
+          weight: 600
+    - family: OrbitSerif
+      fonts:
+        - asset: assets/fonts/OrbitSerif-Regular.ttf
+        - asset: assets/fonts/OrbitSerif-Medium.ttf
+          weight: 500

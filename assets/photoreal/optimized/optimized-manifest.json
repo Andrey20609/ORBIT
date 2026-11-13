@@ -1,0 +1,64 @@
+{
+  "assets": [
+    {
+      "file": "one.jpg",
+      "source": "kloppenheim_06.jpg",
+      "size": [
+        1080,
+        2400
+      ],
+      "sha256": "80206834b6d65ac85ea04f1cbd3664cee5502329abc4c4ae8463ea2047855066",
+      "bytes": 464202
+    },
+    {
+      "file": "atelier.jpg",
+      "source": "the_sky_is_on_fire_IMG_0809.jpg",
+      "size": [
+        1080,
+        2400
+      ],
+      "sha256": "3de2499568880a48d49c221717ec46781512b2ae733250b0b060293e5e694809",
+      "bytes": 419400
+    },
+    {
+      "file": "zen.jpg",
+      "source": "kloppenheim_06_puresky.jpg",
+      "size": [
+        1080,
+        2400
+      ],
+      "sha256": "b01c68ca4e61ccfa138f9ab92bd2c7e8d6987dbaaa669fe4c69d143d433254cb",
+      "bytes": 211026
+    },
+    {
+      "file": "rocks_diffuse.jpg",
+      "source": "aerial_rocks_02_diff_2k.jpg",
+      "size": [
+        1024,
+        1024
+      ],
+      "sha256": "13688f903a7c58b01ace60adb6af4bc42dc213abbb653bd018a975479a9206a6",
+      "bytes": 508813
+    },
+    {
+      "file": "rocks_roughness.jpg",
+      "source": "aerial_rocks_02_rough_2k.jpg",
+      "size": [
+        1024,
+        1024
+      ],
+      "sha256": "22bca8d54c54227931e8879bb2236e13630484b5b8e85017d12fd6c8ce33bd79",
+      "bytes": 364895
+    },
+    {
+      "file": "rocks_normal.jpg",
+      "source": "aerial_rocks_02_nor_gl_2k.jpg",
+      "size": [
+        1024,
+        1024
+      ],
+      "sha256": "0deceae54aa2ffd18928b1ff14cfb236ff9529b12b073ea74389070f43bac59a",
+      "bytes": 576265
+    }
+  ]
+}

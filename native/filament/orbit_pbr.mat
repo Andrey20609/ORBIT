@@ -1,0 +1,24 @@
+material {
+    name : OrbitPBR,
+    shadingModel : lit,
+    parameters : [
+        { type : float3, name : baseColor },
+        { type : float, name : roughness },
+        { type : float, name : metallic },
+        { type : sampler2d, name : baseColorMap },
+        { type : sampler2d, name : normalMap },
+        { type : sampler2d, name : roughnessMap }
+    ],
+    requires : [ uv0 ],
+}
+fragment {
+    void material(inout MaterialInputs material) {
+        prepareMaterial(material);
+        vec3 texel = texture(materialParams_baseColorMap, getUV0()).rgb;
+        material.baseColor.rgb = texel * materialParams.baseColor;
+        vec3 normalTexel = texture(materialParams_normalMap, getUV0()).xyz * 2.0 - 1.0;
+        material.normal = normalize(getWorldTangentFrame() * normalTexel);
+        material.roughness = clamp(texture(materialParams_roughnessMap, getUV0()).r * materialParams.roughness, 0.08, 1.0);
+        material.metallic = materialParams.metallic;
+    }
+}

@@ -1,0 +1,47 @@
+{
+  "license": "CC0-1.0",
+  "assets": [
+    {
+      "file": "kloppenheim_06.jpg",
+      "url": "https://dl.polyhaven.org/file/ph-assets/HDRIs/extra/Tonemapped%20JPG/kloppenheim_06.jpg",
+      "md5": "e0bae2fe816032852f4c180d4a46ab99",
+      "bytes": 4142445
+    },
+    {
+      "file": "the_sky_is_on_fire_IMG_0809.jpg",
+      "url": "https://dl.polyhaven.org/file/ph-assets/HDRIs/extra/Backplates/the_sky_is_on_fire/jpg_pretty/IMG_0809.jpg",
+      "md5": "b1c1bb4ebf0cd355a478e36c4cdee02b",
+      "bytes": 5711189
+    },
+    {
+      "file": "kloppenheim_06_puresky.jpg",
+      "url": "https://dl.polyhaven.org/file/ph-assets/HDRIs/extra/Tonemapped%20JPG/kloppenheim_06_puresky.jpg",
+      "md5": "958a8792cecb20d602dab110ebc23e06",
+      "bytes": 18968534
+    },
+    {
+      "file": "aerial_rocks_02_diff_2k.jpg",
+      "url": "https://dl.polyhaven.org/file/ph-assets/Textures/jpg/2k/aerial_rocks_02/aerial_rocks_02_diff_2k.jpg",
+      "md5": "f493fa9b31911f8a30ecd1d41cbc6f3d",
+      "bytes": 2914545
+    },
+    {
+      "file": "aerial_rocks_02_rough_2k.jpg",
+      "url": "https://dl.polyhaven.org/file/ph-assets/Textures/jpg/2k/aerial_rocks_02/aerial_rocks_02_rough_2k.jpg",
+      "md5": "2d4464ceba47763b2ae75242e6f66270",
+      "bytes": 1475961
+    },
+    {
+      "file": "aerial_rocks_02_nor_gl_2k.jpg",
+      "url": "https://dl.polyhaven.org/file/ph-assets/Textures/jpg/2k/aerial_rocks_02/aerial_rocks_02_nor_gl_2k.jpg",
+      "md5": "7c405cfd3308a2672c99b44e102c328e",
+      "bytes": 4300188
+    },
+    {
+      "file": "kloppenheim_06_2k.hdr",
+      "url": "https://dl.polyhaven.org/file/ph-assets/HDRIs/hdr/2k/kloppenheim_06_2k.hdr",
+      "md5": "86deab62942f3ba6004fda4377769bf7",
+      "bytes": 5830386
+    }
+  ]
+}

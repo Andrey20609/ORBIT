@@ -1,0 +1,155 @@
+<Rive version="1" kind="fragment">
+  <Artboard defaultStateMachineId="0:100" styleId="0:2" width="500" height="620" name="OrbitAtmosphere" id="0:1">
+    <LayoutComponentStyle name="Artboard Style" id="0:2"/>
+
+    <Shape x="250" y="310" name="Twilight sky" id="0:3">
+      <Rectangle width="500" height="620"/>
+      <Fill><LinearGradient startX="0" startY="-310" endX="0" endY="310">
+        <GradientStop colorValue="FF080D24" position="0"/>
+        <GradientStop colorValue="FF25254A" position="0.48"/>
+        <GradientStop colorValue="FF80556D" position="0.76"/>
+        <GradientStop colorValue="FF17243A" position="1"/>
+      </LinearGradient></Fill>
+    </Shape>
+
+    <Shape x="350" y="166" name="Solar atmosphere" id="0:4" opacity="0.9">
+      <Ellipse width="250" height="250"/>
+      <Fill><RadialGradient startX="0" startY="0" endX="125" endY="0">
+        <GradientStop colorValue="80FFE1BC" position="0"/>
+        <GradientStop colorValue="30FFB5C8" position="0.42"/>
+        <GradientStop colorValue="00E49CDD" position="1"/>
+      </RadialGradient></Fill>
+    </Shape>
+    <Shape x="350" y="166" name="Sun" id="0:5">
+      <Ellipse width="66" height="66"/>
+      <Fill><RadialGradient startX="-12" startY="-14" endX="38" endY="30">
+        <GradientStop colorValue="FFFFFBEB" position="0"/>
+        <GradientStop colorValue="FFFFD7AE" position="0.58"/>
+        <GradientStop colorValue="FFFFACBD" position="1"/>
+      </RadialGradient></Fill>
+    </Shape>
+
+    <Node name="High clouds" id="0:6" x="0" y="0" opacity="0.48">
+      <Shape x="90" y="140" name="Cloud one"><Ellipse width="210" height="42"/><Fill><SolidColor colorValue="38E5D9FF"/></Fill></Shape>
+      <Shape x="146" y="128" name="Cloud two"><Ellipse width="124" height="40"/><Fill><SolidColor colorValue="28F8E7FF"/></Fill></Shape>
+      <Shape x="420" y="250" name="Cloud three"><Ellipse width="230" height="35"/><Fill><SolidColor colorValue="24F5DAEA"/></Fill></Shape>
+    </Node>
+
+    <Shape name="Distant mountains" id="0:7" opacity="0.8">
+      <PointsPath isClosed="true">
+        <StraightVertex x="0" y="358"/><StraightVertex x="52" y="296"/><StraightVertex x="86" y="320"/>
+        <StraightVertex x="148" y="244"/><StraightVertex x="188" y="301"/><StraightVertex x="232" y="272"/>
+        <StraightVertex x="288" y="334"/><StraightVertex x="356" y="260"/><StraightVertex x="398" y="304"/>
+        <StraightVertex x="452" y="270"/><StraightVertex x="500" y="328"/><StraightVertex x="500" y="480"/><StraightVertex x="0" y="480"/>
+      </PointsPath>
+      <Fill><LinearGradient startX="250" startY="250" endX="250" endY="470">
+        <GradientStop colorValue="FF686589" position="0"/><GradientStop colorValue="FF353A5C" position="1"/>
+      </LinearGradient></Fill>
+    </Shape>
+    <Shape name="Snow ridges" id="0:8" opacity="0.42">
+      <PointsPath isClosed="true">
+        <StraightVertex x="111" y="291"/><StraightVertex x="148" y="244"/><StraightVertex x="181" y="291"/>
+        <StraightVertex x="156" y="276"/><StraightVertex x="146" y="287"/><StraightVertex x="136" y="272"/>
+      </PointsPath>
+      <Fill><SolidColor colorValue="B8E4DFFF"/></Fill>
+    </Shape>
+    <Shape name="Near mountains" id="0:9">
+      <PointsPath isClosed="true">
+        <StraightVertex x="0" y="398"/><StraightVertex x="70" y="346"/><StraightVertex x="118" y="384"/>
+        <StraightVertex x="194" y="316"/><StraightVertex x="264" y="390"/><StraightVertex x="326" y="338"/>
+        <StraightVertex x="390" y="389"/><StraightVertex x="448" y="344"/><StraightVertex x="500" y="382"/>
+        <StraightVertex x="500" y="486"/><StraightVertex x="0" y="486"/>
+      </PointsPath>
+      <Fill><LinearGradient startX="180" startY="320" endX="330" endY="486">
+        <GradientStop colorValue="FF30384E" position="0"/><GradientStop colorValue="FF111B30" position="1"/>
+      </LinearGradient></Fill>
+    </Shape>
+
+    <Shape x="250" y="528" name="Lake" id="0:10">
+      <Rectangle width="500" height="184"/>
+      <Fill><LinearGradient startX="0" startY="-92" endX="0" endY="92">
+        <GradientStop colorValue="FF26374B" position="0"/><GradientStop colorValue="FF0B1428" position="1"/>
+      </LinearGradient></Fill>
+    </Shape>
+    <Node name="Water reflections" id="0:11" opacity="0.5">
+      <Shape x="350" y="454"><Ellipse width="132" height="5"/><Fill><SolidColor colorValue="88FFD5C0"/></Fill></Shape>
+      <Shape x="350" y="472"><Ellipse width="96" height="3"/><Fill><SolidColor colorValue="60E9C8E8"/></Fill></Shape>
+      <Shape x="340" y="494"><Ellipse width="170" height="3"/><Fill><SolidColor colorValue="38B3C9FF"/></Fill></Shape>
+      <Shape x="190" y="536"><Ellipse width="260" height="2"/><Fill><SolidColor colorValue="30A9B7ED"/></Fill></Shape>
+      <Shape x="380" y="574"><Ellipse width="190" height="2"/><Fill><SolidColor colorValue="26A9B7ED"/></Fill></Shape>
+    </Node>
+
+    <Shape x="250" y="280" name="Pulse halo" id="0:12" opacity="0.35">
+      <Ellipse width="236" height="236"/>
+      <Fill><RadialGradient startX="0" startY="0" endX="118" endY="0">
+        <GradientStop colorValue="52B5A5FF" position="0"/><GradientStop colorValue="167CC8FF" position="0.58"/><GradientStop colorValue="007CC8FF" position="1"/>
+      </RadialGradient></Fill>
+    </Shape>
+    <Node x="250" y="280" name="Interactive orbit" id="0:20">
+      <Shape name="Orbit glow" id="0:21" opacity="0.45">
+        <Ellipse width="144" height="144"/>
+        <Stroke thickness="14"><LinearGradient startX="-72" startY="-72" endX="72" endY="72">
+          <GradientStop colorValue="2078D9FF" position="0"/><GradientStop colorValue="289B8CFF" position="0.5"/><GradientStop colorValue="20FFB5D8" position="1"/>
+        </LinearGradient></Stroke>
+      </Shape>
+      <Shape name="Primary ring" id="0:22">
+        <Ellipse width="128" height="128"/>
+        <Stroke thickness="6" cap="round"><LinearGradient startX="-64" startY="-64" endX="64" endY="64">
+          <GradientStop colorValue="FF78D9FF" position="0"/><GradientStop colorValue="FF9B8CFF" position="0.48"/><GradientStop colorValue="FFFFB5D8" position="1"/>
+        </LinearGradient></Stroke>
+      </Shape>
+      <Shape name="Inner horizon" id="0:23" opacity="0.8">
+        <Ellipse width="94" height="94"/>
+        <Stroke thickness="1.5"><LinearGradient startX="-47" startY="0" endX="47" endY="0">
+          <GradientStop colorValue="00FFFFFF" position="0"/><GradientStop colorValue="88FFFFFF" position="0.5"/><GradientStop colorValue="00FFFFFF" position="1"/>
+        </LinearGradient></Stroke>
+      </Shape>
+      <Node name="Satellite system" id="0:24">
+        <Shape name="Tilted orbit" id="0:25" rotation="-0.38" opacity="0.65">
+          <Ellipse width="202" height="88"/>
+          <Stroke thickness="2"><LinearGradient startX="-101" startY="0" endX="101" endY="0">
+            <GradientStop colorValue="007CC8FF" position="0"/><GradientStop colorValue="FF9BE7FF" position="0.45"/><GradientStop colorValue="FFC0A4FF" position="1"/>
+          </LinearGradient></Stroke>
+        </Shape>
+        <Shape name="Satellite glow" id="0:26" x="91" y="0" opacity="0.55"><Ellipse width="34" height="34"/><Fill><RadialGradient startX="0" startY="0" endX="17" endY="0"><GradientStop colorValue="CCFFFFFF" position="0"/><GradientStop colorValue="009C8CFF" position="1"/></RadialGradient></Fill></Shape>
+        <Shape name="Satellite" id="0:27" x="91" y="0"><Ellipse width="11" height="11"/><Fill><SolidColor colorValue="FFFFFFFF"/></Fill></Shape>
+      </Node>
+    </Node>
+
+    <StateMachine name="OrbitLoop" id="0:100">
+      <StateMachineTrigger name="Pulse" id="0:120"/>
+      <StateMachineListenerSingle name="Orbit touch pulse" targetId="0:20" listenerTypeValue="click">
+        <ListenerTriggerChange inputId="0:120"/>
+      </StateMachineListenerSingle>
+      <StateMachineLayer name="Ambient motion" id="0:101">
+        <AnyState x="200" y="-120"/><ExitState x="400" y="-120"/>
+        <EntryState><StateTransition stateToId="0:102"/></EntryState>
+        <AnimationState x="200" animationId="0:110" id="0:102"/>
+      </StateMachineLayer>
+      <StateMachineLayer name="Touch interaction" id="0:121">
+        <AnyState x="200" y="-120"/><ExitState x="400" y="-120"/>
+        <EntryState><StateTransition stateToId="0:122"/></EntryState>
+        <AnimationState x="100" y="40" animationId="0:113" id="0:122">
+          <StateTransition stateToId="0:123" duration="120"><TransitionTriggerCondition inputId="0:120"/></StateTransition>
+        </AnimationState>
+        <AnimationState x="330" y="40" animationId="0:111" id="0:123">
+          <StateTransition stateToId="0:122" exitTime="1000" flags="enableExitTime" duration="180"/>
+        </AnimationState>
+      </StateMachineLayer>
+    </StateMachine>
+
+    <LinearAnimation loopValue="1" duration="240" name="Breathing landscape" id="0:110">
+      <KeyedObject objectId="0:24"><KeyedProperty propertyKey="15"><KeyFrameDouble value="0" interpolationType="1"/><KeyFrameDouble value="6.2831855" interpolationType="1" frame="240"/></KeyedProperty></KeyedObject>
+      <KeyedObject objectId="0:6"><KeyedProperty propertyKey="13"><KeyFrameDouble value="-18" interpolationType="2"/><KeyFrameDouble value="18" interpolationType="2" frame="120"/><KeyFrameDouble value="-18" interpolationType="2" frame="240"/></KeyedProperty></KeyedObject>
+      <KeyedObject objectId="0:11"><KeyedProperty propertyKey="18"><KeyFrameDouble value="0.32" interpolationType="2"/><KeyFrameDouble value="0.62" interpolationType="2" frame="120"/><KeyFrameDouble value="0.32" interpolationType="2" frame="240"/></KeyedProperty></KeyedObject>
+      <KeyedObject objectId="0:4"><KeyedProperty propertyKey="16"><KeyFrameDouble value="0.94" interpolationType="2"/><KeyFrameDouble value="1.06" interpolationType="2" frame="120"/><KeyFrameDouble value="0.94" interpolationType="2" frame="240"/></KeyedProperty><KeyedProperty propertyKey="17"><KeyFrameDouble value="0.94" interpolationType="2"/><KeyFrameDouble value="1.06" interpolationType="2" frame="120"/><KeyFrameDouble value="0.94" interpolationType="2" frame="240"/></KeyedProperty></KeyedObject>
+    </LinearAnimation>
+    <LinearAnimation duration="60" name="Touch pulse" id="0:111">
+      <KeyedObject objectId="0:20"><KeyedProperty propertyKey="16"><KeyFrameDouble value="1" interpolationType="2"/><KeyFrameDouble value="1.14" interpolationType="2" frame="24"/><KeyFrameDouble value="1" interpolationType="2" frame="60"/></KeyedProperty><KeyedProperty propertyKey="17"><KeyFrameDouble value="1" interpolationType="2"/><KeyFrameDouble value="1.14" interpolationType="2" frame="24"/><KeyFrameDouble value="1" interpolationType="2" frame="60"/></KeyedProperty></KeyedObject>
+      <KeyedObject objectId="0:12"><KeyedProperty propertyKey="16"><KeyFrameDouble value="0.8" interpolationType="2"/><KeyFrameDouble value="1.35" interpolationType="2" frame="60"/></KeyedProperty><KeyedProperty propertyKey="17"><KeyFrameDouble value="0.8" interpolationType="2"/><KeyFrameDouble value="1.35" interpolationType="2" frame="60"/></KeyedProperty><KeyedProperty propertyKey="18"><KeyFrameDouble value="0.65" interpolationType="2"/><KeyFrameDouble value="0" interpolationType="2" frame="60"/></KeyedProperty></KeyedObject>
+    </LinearAnimation>
+    <LinearAnimation duration="1" name="Idle" id="0:113">
+      <KeyedObject objectId="0:12"><KeyedProperty propertyKey="16"><KeyFrameDouble value="0.9"/></KeyedProperty><KeyedProperty propertyKey="17"><KeyFrameDouble value="0.9"/></KeyedProperty><KeyedProperty propertyKey="18"><KeyFrameDouble value="0.3"/></KeyedProperty></KeyedObject>
+    </LinearAnimation>
+  </Artboard>
+</Rive>

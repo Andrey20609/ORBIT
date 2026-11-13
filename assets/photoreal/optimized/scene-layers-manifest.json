@@ -1,0 +1,32 @@
+{
+  "license": "CC0 derivatives of assets documented in ../LICENSES.md",
+  "layers": [
+    {
+      "profile": "one",
+      "base": "one.jpg",
+      "foreground": "one_foreground.webp",
+      "alphaStart": 0.38,
+      "alphaEnd": 0.57,
+      "bytes": 300002,
+      "sha256": "7fbc14b7fd7cf5d9f1b2c7f870cf72c7b368632ceb21654e48e3eab9005504ef"
+    },
+    {
+      "profile": "atelier",
+      "base": "atelier.jpg",
+      "foreground": "atelier_foreground.webp",
+      "alphaStart": 0.45,
+      "alphaEnd": 0.62,
+      "bytes": 166272,
+      "sha256": "7b9244984d40961014f2e4bb043544a489c9a62c3fb171777dbd8ed1673be6f6"
+    },
+    {
+      "profile": "zen",
+      "base": "zen.jpg",
+      "foreground": "zen_foreground.webp",
+      "alphaStart": 0.58,
+      "alphaEnd": 0.76,
+      "bytes": 57366,
+      "sha256": "7b0067f1d7d0f3dc28a91b197bea924996ef5bf6696d7b264ede589b1dc761e1"
+    }
+  ]
+}
