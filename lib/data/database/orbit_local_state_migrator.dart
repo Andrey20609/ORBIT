@@ -47,53 +47,60 @@ final class OrbitLocalStateMigrator {
       var tasksMigrated = 0;
       var eventsMigrated = 0;
 
-      // 1. Migrate tasks
-      final rawTasks = legacyState['tasks'];
-      if (rawTasks is List) {
-        for (final item in rawTasks) {
-          if (item is Map<String, Object?>) {
-            final task = TaskRecord(
-              id: item['id']! as String,
-              workspaceId: defaultWorkspaceId,
-              title: item['title']! as String,
-              project: item['project'] as String?,
-              dueDate: item['due'] as String?,
-              isDone: (item['done'] as bool?) ?? false,
-              priority: (item['priority'] as num?)?.toInt() ?? 0,
-              createdAt: DateTime.now().toUtc(),
-            );
-            await _dataEngine.saveTask(task);
-            tasksMigrated++;
+      // Вся миграция выполняется в одной транзакции: при ошибке ни одна
+      // запись не остаётся частично перенесённой. Повторный запуск не
+      // создаёт дубликаты: saveTask/saveEvent пишут с replace-on-conflict
+      // по тем же id.
+      await _dataEngine.runInTransaction(() async {
+        // 1. Migrate tasks
+        final rawTasks = legacyState['tasks'];
+        if (rawTasks is List) {
+          for (final item in rawTasks) {
+            if (item is Map<String, Object?>) {
+              final task = TaskRecord(
+                id: item['id']! as String,
+                workspaceId: defaultWorkspaceId,
+                title: item['title']! as String,
+                project: item['project'] as String?,
+                dueDate: item['due'] as String?,
+                isDone: (item['done'] as bool?) ?? false,
+                priority: (item['priority'] as num?)?.toInt() ?? 0,
+                createdAt: DateTime.now().toUtc(),
+              );
+              await _dataEngine.saveTask(task);
+              tasksMigrated++;
+            }
           }
         }
-      }
 
-      // 2. Migrate events
-      final rawEvents = legacyState['events'];
-      if (rawEvents is List) {
-        for (final item in rawEvents) {
-          if (item is Map<String, Object?>) {
-            final startTime = item['start'] != null
-                ? DateTime.tryParse(item['start'] as String) ?? DateTime.now()
-                : DateTime.now();
-            final endTime = item['end'] != null
-                ? DateTime.tryParse(item['end'] as String) ?? startTime.add(const Duration(hours: 1))
-                : startTime.add(const Duration(hours: 1));
+        // 2. Migrate events
+        final rawEvents = legacyState['events'];
+        if (rawEvents is List) {
+          for (final item in rawEvents) {
+            if (item is Map<String, Object?>) {
+              final startTime = item['start'] != null
+                  ? DateTime.tryParse(item['start'] as String) ?? DateTime.now()
+                  : DateTime.now();
+              final endTime = item['end'] != null
+                  ? DateTime.tryParse(item['end'] as String) ??
+                        startTime.add(const Duration(hours: 1))
+                  : startTime.add(const Duration(hours: 1));
 
-            final event = EventRecord(
-              id: item['id']! as String,
-              workspaceId: defaultWorkspaceId,
-              title: (item['title'] as String?) ?? 'Событие',
-              description: item['location'] as String?,
-              startTime: startTime.toUtc(),
-              endTime: endTime.toUtc(),
-              location: item['location'] as String?,
-            );
-            await _dataEngine.saveEvent(event);
-            eventsMigrated++;
+              final event = EventRecord(
+                id: item['id']! as String,
+                workspaceId: defaultWorkspaceId,
+                title: (item['title'] as String?) ?? 'Событие',
+                description: item['location'] as String?,
+                startTime: startTime.toUtc(),
+                endTime: endTime.toUtc(),
+                location: item['location'] as String?,
+              );
+              await _dataEngine.saveEvent(event);
+              eventsMigrated++;
+            }
           }
         }
-      }
+      });
 
       return MigrationResult(
         tasksMigrated: tasksMigrated,

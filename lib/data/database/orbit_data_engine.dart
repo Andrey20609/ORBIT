@@ -39,6 +39,13 @@ final class OrbitDataEngine extends ChangeNotifier {
     notifyListeners();
   }
 
+  /// Runs [action] inside a database transaction. On any error the whole
+  /// batch is rolled back; successful completion commits atomically.
+  /// Used by [OrbitLocalStateMigrator]; does not change the app flow.
+  Future<T> runInTransaction<T>(Future<T> Function() action) {
+    return _db.transaction((_) => action());
+  }
+
   // --- Workspaces ---
 
   Future<List<WorkspaceRecord>> getWorkspaces() async {
