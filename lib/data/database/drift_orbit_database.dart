@@ -27,6 +27,7 @@ final class DriftOrbitDatabase implements OrbitDatabase {
 
   bool _isOpen = false;
   _OrbitDriftCore? _core;
+  Future<void>? _opening;
 
   @override
   bool get isOpen => _isOpen;
@@ -48,6 +49,7 @@ final class DriftOrbitDatabase implements OrbitDatabase {
       OrbitDatabaseSchema.tableNotes,
       OrbitDatabaseSchema.tableContacts,
       OrbitDatabaseSchema.tableFiles,
+      snapshotTableName,
     };
     if (!known.contains(table)) {
       throw ArgumentError.value(table, 'table', 'Unknown ORBIT table');
@@ -55,9 +57,212 @@ final class DriftOrbitDatabase implements OrbitDatabase {
     return table;
   }
 
+  /// Kimi STEP1 remark #3: where/orderBy fragments are checked against a
+  /// per-table column allowlist before being embedded into SQL, so dynamic
+  /// or hostile input can never inject extra SQL syntax.
+  static const Map<String, Set<String>> _tableColumns = {
+    OrbitDatabaseSchema.tableWorkspaces: {
+      'id',
+      'name',
+      'type',
+      'color_value',
+      'is_default',
+      'created_at',
+    },
+    OrbitDatabaseSchema.tableAccounts: {
+      'id',
+      'workspace_id',
+      'email',
+      'display_name',
+      'provider_type',
+      'sync_status',
+      'last_sync_at',
+    },
+    OrbitDatabaseSchema.tableEmails: {
+      'id',
+      'workspace_id',
+      'account_id',
+      'folder',
+      'sender',
+      'recipient',
+      'subject',
+      'preview',
+      'body',
+      'timestamp',
+      'is_read',
+      'is_flagged',
+      'has_attachments',
+    },
+    OrbitDatabaseSchema.tableEvents: {
+      'id',
+      'workspace_id',
+      'title',
+      'description',
+      'start_time',
+      'end_time',
+      'location',
+      'is_all_day',
+      'category',
+      'participants_json',
+    },
+    OrbitDatabaseSchema.tableTasks: {
+      'id',
+      'workspace_id',
+      'title',
+      'project',
+      'due_date',
+      'is_done',
+      'priority',
+      'created_at',
+    },
+    OrbitDatabaseSchema.tableNotes: {
+      'id',
+      'workspace_id',
+      'title',
+      'content',
+      'tags_json',
+      'updated_at',
+    },
+    OrbitDatabaseSchema.tableContacts: {
+      'id',
+      'workspace_id',
+      'name',
+      'email',
+      'phone',
+      'company',
+      'role',
+      'avatar_url',
+    },
+    OrbitDatabaseSchema.tableFiles: {
+      'id',
+      'workspace_id',
+      'file_name',
+      'extension',
+      'size_bytes',
+      'mime_type',
+      'local_path',
+      'remote_uri',
+      'associated_entity_type',
+      'associated_entity_id',
+      'created_at',
+      'updated_at',
+    },
+    snapshotTableName: {'id', 'payload_json', 'updated_at'},
+  };
+
+  static final RegExp _identifierInText = RegExp(r'[A-Za-z_][A-Za-z0-9_]*');
+  static const _sqlKeywords = {
+    'AND',
+    'OR',
+    'NOT',
+    'NULL',
+    'IN',
+    'LIKE',
+    'GLOB',
+    'BETWEEN',
+    'IS',
+    'EXISTS',
+    'CASE',
+    'WHEN',
+    'THEN',
+    'ELSE',
+    'END',
+    'ASC',
+    'DESC',
+    'COLLATE',
+    'ESCAPE',
+    'TRUE',
+    'FALSE',
+  };
+  static final RegExp _forbiddenFragment = RegExp(r';|--|/\*|\*/');
+  static final RegExp _forbiddenWhereKeyword = RegExp(
+    r'\b(ATTACH|DETACH|PRAGMA|DROP|CREATE|ALTER|REPLACE|VACUUM|REINDEX|'
+    r'UNION|SELECT|INSERT|UPDATE|DELETE|ORDER\s+BY|GROUP\s+BY|LIMIT)\b',
+    caseSensitive: false,
+  );
+
+  static void _validateWhere(String table, String where) {
+    if (_forbiddenFragment.hasMatch(where)) {
+      throw ArgumentError.value(
+        where,
+        'where',
+        'Forbidden SQL fragment in WHERE clause',
+      );
+    }
+    if (_forbiddenWhereKeyword.hasMatch(where)) {
+      throw ArgumentError.value(
+        where,
+        'where',
+        'Forbidden SQL keyword in WHERE clause',
+      );
+    }
+    final columns = _tableColumns[table]!;
+    for (final match in _identifierInText.allMatches(where)) {
+      final identifier = match.group(0)!;
+      if (_sqlKeywords.contains(identifier.toUpperCase())) continue;
+      if (!columns.contains(identifier)) {
+        throw ArgumentError.value(
+          where,
+          'where',
+          "Unknown column '$identifier' for table '$table'",
+        );
+      }
+    }
+  }
+
+  static void _validateOrderBy(String table, String orderBy) {
+    final columns = _tableColumns[table]!;
+    final segmentPattern = RegExp(
+      r'^\s*([A-Za-z_][A-Za-z0-9_]*)(\s+(ASC|DESC))?\s*$',
+      caseSensitive: false,
+    );
+    for (final rawSegment in orderBy.split(',')) {
+      final match = segmentPattern.firstMatch(rawSegment);
+      if (match == null) {
+        throw ArgumentError.value(
+          orderBy,
+          'orderBy',
+          'orderBy must be a comma list of "column [ASC|DESC]"',
+        );
+      }
+      final column = match.group(1)!;
+      if (!columns.contains(column)) {
+        throw ArgumentError.value(
+          orderBy,
+          'orderBy',
+          "Unknown column '$column' for table '$table'",
+        );
+      }
+    }
+  }
+
+  static void _validateLimit(int limit) {
+    if (limit < 0) {
+      throw ArgumentError.value(limit, 'limit', 'limit must be >= 0');
+    }
+  }
+
   @override
   Future<void> open() async {
     if (_isOpen && _core != null) return;
+    // Kimi STEP1 remark #2: concurrent open() calls must share one
+    // in-flight opening instead of racing competing connections.
+    final existing = _opening;
+    if (existing != null) {
+      return existing;
+    }
+    final opening = _openInternal();
+    _opening = opening;
+    try {
+      await opening;
+    } finally {
+      if (identical(_opening, opening)) {
+        _opening = null;
+      }
+    }
+  }
+
+  Future<void> _openInternal() async {
     final executor = file == null
         ? NativeDatabase.memory()
         : NativeDatabase(file!);
@@ -87,6 +292,15 @@ final class DriftOrbitDatabase implements OrbitDatabase {
   }) async {
     final core = await _requireCore();
     final safeTable = _validateTable(table);
+    if (where != null && where.isNotEmpty) {
+      _validateWhere(safeTable, where);
+    }
+    if (orderBy != null && orderBy.isNotEmpty) {
+      _validateOrderBy(safeTable, orderBy);
+    }
+    if (limit != null) {
+      _validateLimit(limit);
+    }
     final buffer = StringBuffer('SELECT * FROM $safeTable');
     if (where != null && where.isNotEmpty) {
       buffer.write(' WHERE $where');
@@ -153,6 +367,7 @@ final class DriftOrbitDatabase implements OrbitDatabase {
       for (final column in values.keys) Variable(values[column]),
     ];
     if (where != null && where.isNotEmpty) {
+      _validateWhere(safeTable, where);
       statement.write(' WHERE $where');
       variables.addAll([
         for (final arg in whereArgs ?? const <Object?>[]) Variable(arg),
@@ -176,6 +391,7 @@ final class DriftOrbitDatabase implements OrbitDatabase {
     final statement = StringBuffer('DELETE FROM $safeTable');
     final variables = <Variable>[];
     if (where != null && where.isNotEmpty) {
+      _validateWhere(safeTable, where);
       statement.write(' WHERE $where');
       variables.addAll([
         for (final arg in whereArgs ?? const <Object?>[]) Variable(arg),
@@ -196,6 +412,17 @@ final class DriftOrbitDatabase implements OrbitDatabase {
   }
 }
 
+/// STEP2: single-row storage for the full JSON state snapshot that backs
+/// DriftLocalStateRepository. One row (id = 1), written atomically.
+const String snapshotTableName = 'app_state_snapshots';
+const String createSnapshotTable = '''
+  CREATE TABLE IF NOT EXISTS app_state_snapshots (
+    id INTEGER PRIMARY KEY,
+    payload_json TEXT NOT NULL,
+    updated_at INTEGER NOT NULL
+  );
+''';
+
 /// Thin [GeneratedDatabase] shell that owns the connection, creates the
 /// existing ORBIT SQL schema verbatim and seeds default workspaces the same
 /// way [MemoryOrbitDatabase] does.
@@ -211,15 +438,19 @@ final class _OrbitDriftCore extends GeneratedDatabase {
   bool _seeded = false;
 
   /// Forces the lazy connection open. Drift runs the migration strategy
-  /// (schema creation + workspace seeding) on this first statement.
+  /// (schema creation + workspace seeding) on this first statement; the
+  /// snapshot table is ensured separately so older STEP1 files upgrade
+  /// in place without a schema version bump.
   Future<void> doOpen() async {
     await customStatement('PRAGMA foreign_keys = ON');
+    await customStatement(createSnapshotTable);
   }
 
   @override
   MigrationStrategy get migration => MigrationStrategy(
     onCreate: (migrator) async {
       for (final statement in <String>[
+        createSnapshotTable,
         OrbitDatabaseSchema.createWorkspaces,
         OrbitDatabaseSchema.createAccounts,
         OrbitDatabaseSchema.createEmails,

@@ -1,6 +1,6 @@
 import 'package:flutter/material.dart';
 
-import 'data/orbit_local_state_repository.dart';
+import 'data/drift_local_state_repository.dart';
 import 'orbit_bootstrap.dart';
 import 'state/app_state.dart';
 import 'visual_engine/orbit_visual_engine.dart';
@@ -14,7 +14,7 @@ void main() {
   };
   final style = OrbitStyleManager(SharedPreferencesAppearanceRepository());
   final quality = OrbitQualityManager();
-  final appState = OrbitAppState(SharedPreferencesLocalStateRepository());
+  final appState = OrbitAppState(DriftLocalStateRepository());
   debugPrint('[ORBIT startup] running branded shell');
   runApp(
     OrbitBootstrap(

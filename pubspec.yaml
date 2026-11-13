@@ -1,7 +1,7 @@
 name: orbit_visual_lab
 description: ORBIT — personal digital ecosystem.
 publish_to: none
-version: 0.5.31+37
+version: 0.5.32+38
 
 environment:
   sdk: ">=3.10.0 <4.0.0"
@@ -20,6 +20,7 @@ dependencies:
   drift: ^2.35.4
   sqlite3_flutter_libs: ^0.6.0+eol
   sqlite3: ^3.9.1
+  path_provider: ^2.1.6
 
 dev_dependencies:
   flutter_test:
