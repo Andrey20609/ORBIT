@@ -82,6 +82,7 @@ abstract final class OrbitDatabaseSchema {
       is_read INTEGER NOT NULL,
       is_flagged INTEGER NOT NULL,
       has_attachments INTEGER NOT NULL,
+      source_type TEXT NOT NULL DEFAULT 'user',
       FOREIGN KEY (workspace_id) REFERENCES workspaces (id) ON DELETE CASCADE
     );
   ''';

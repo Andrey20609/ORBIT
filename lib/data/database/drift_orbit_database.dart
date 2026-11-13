@@ -93,6 +93,7 @@ final class DriftOrbitDatabase implements OrbitDatabase {
       'is_read',
       'is_flagged',
       'has_attachments',
+      'source_type',
     },
     OrbitDatabaseSchema.tableEvents: {
       'id',
@@ -184,22 +185,26 @@ final class DriftOrbitDatabase implements OrbitDatabase {
   );
 
   static void _validateWhere(String table, String where) {
-    if (_forbiddenFragment.hasMatch(where)) {
+    // Strip quoted literals first: their content is data (id 'project-update'
+    // contains the word "update"), never an identifier or a keyword.
+    final literalPattern = RegExp("'[^']*'|\"[^\"]*\"");
+    final withoutLiterals = where.replaceAll(literalPattern, '?');
+    if (_forbiddenFragment.hasMatch(withoutLiterals)) {
       throw ArgumentError.value(
-        where,
+        withoutLiterals,
         'where',
         'Forbidden SQL fragment in WHERE clause',
       );
     }
-    if (_forbiddenWhereKeyword.hasMatch(where)) {
+    if (_forbiddenWhereKeyword.hasMatch(withoutLiterals)) {
       throw ArgumentError.value(
-        where,
+        withoutLiterals,
         'where',
         'Forbidden SQL keyword in WHERE clause',
       );
     }
     final columns = _tableColumns[table]!;
-    for (final match in _identifierInText.allMatches(where)) {
+    for (final match in _identifierInText.allMatches(withoutLiterals)) {
       final identifier = match.group(0)!;
       if (_sqlKeywords.contains(identifier.toUpperCase())) continue;
       if (!columns.contains(identifier)) {
@@ -402,6 +407,27 @@ final class DriftOrbitDatabase implements OrbitDatabase {
     return core.customUpdate(statement.toString(), variables: variables);
   }
 
+  /// Test/diagnostic helpers over the raw core (bypass the typed layer and
+  /// its allowlist — never expose them to production flows).
+  Future<void> executeRawForTesting(String statement) async {
+    final core = await _requireCore();
+    await core.customStatement(statement);
+  }
+
+  Future<List<Map<String, Object?>>> selectRawForTesting(String sql) async {
+    final core = await _requireCore();
+    final rows = await core.customSelect(sql).get();
+    return rows.map((row) => Map<String, Object?>.of(row.data)).toList();
+  }
+
+  Future<int> updateRawForTesting(String sql, List<Object?> args) async {
+    final core = await _requireCore();
+    return core.customUpdate(
+      sql,
+      variables: [for (final arg in args) Variable(arg)],
+    );
+  }
+
   @override
   Future<T> transaction<T>(Future<T> Function(OrbitDatabase txn) action) async {
     final core = await _requireCore();
@@ -457,6 +483,21 @@ final class _OrbitDriftCore extends GeneratedDatabase {
     await customStatement('PRAGMA foreign_keys = ON');
     await customStatement(createSnapshotTable);
     await customStatement(createMigrationsTable);
+    await _ensureEmailsSourceTypeColumn();
+  }
+
+  /// STEP4 additive schema upgrade: STEP3 files lack `emails.source_type`.
+  /// The column is added once, guarded by a real `PRAGMA table_info` check —
+  /// arbitrary SQLite errors are never masked as "column already exists".
+  Future<void> _ensureEmailsSourceTypeColumn() async {
+    final columns = await customSelect('PRAGMA table_info(emails)').get();
+    final hasSourceType = columns.any(
+      (row) => row.data['name'] == 'source_type',
+    );
+    if (hasSourceType) return;
+    await customStatement(
+      "ALTER TABLE emails ADD COLUMN source_type TEXT NOT NULL DEFAULT 'user'",
+    );
   }
 
   @override

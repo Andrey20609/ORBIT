@@ -98,6 +98,27 @@ Future<DriftOrbitDatabase> _createStep2StyleDatabase(Directory dir) async {
   return db;
 }
 
+
+/// STEP4: counts restricted to the user-owned sent/trash projection.
+Future<int> _userEmailRows(DriftOrbitDatabase db) async {
+  final rows = await db.query(
+    OrbitDatabaseSchema.tableEmails,
+    where: 'source_type = ?',
+    whereArgs: ['user'],
+  );
+  return rows.length;
+}
+
+/// STEP4: marker rows filtered by name.
+Future<int> _markerRows(DriftOrbitDatabase db, String name) async {
+  final rows = await db.query(
+    migrationsTableName,
+    where: 'name = ?',
+    whereArgs: [name],
+  );
+  return rows.length;
+}
+
 void main() {
   late Directory tempDir;
 
@@ -131,10 +152,17 @@ void main() {
 
       // Marker stamped.
       final markers = await db.query(migrationsTableName);
-      expect(markers, hasLength(1));
-      expect(markers.single['name'], DriftLocalStateRepository
-          .mailMigrationMarker);
-      expect((markers.single['applied_at'] as num).toInt(), greaterThan(0));
+      final names = markers.map((m) => m['name']).toSet();
+      expect(
+        names,
+        containsAll(<String>[
+          DriftLocalStateRepository.mailMigrationMarker,
+          DriftLocalStateRepository.demoInboxMigrationMarker,
+        ]),
+      );
+      for (final marker in markers) {
+        expect((marker['applied_at'] as num).toInt(), greaterThan(0));
+      }
 
       // Relational projection filled.
       final accountRows = await db.query(OrbitDatabaseSchema.tableAccounts);
@@ -153,9 +181,18 @@ void main() {
 
       final emailRows = await db.query(
         OrbitDatabaseSchema.tableEmails,
+        where: 'source_type = ?',
+        whereArgs: ['user'],
         orderBy: 'id ASC',
       );
       expect(emailRows, hasLength(2));
+      // STEP4 demo projection exists alongside and never mixes in.
+      final demoRows = await db.query(
+        OrbitDatabaseSchema.tableEmails,
+        where: 'source_type = ?',
+        whereArgs: ['demo'],
+      );
+      expect(demoRows, hasLength(5));
       final sent1 = emailRows.firstWhere((r) => r['id'] == 'sent-1');
       expect(sent1['folder'], 'sent');
       expect(sent1['sender'], 'work@example.com'); // active account email
@@ -198,13 +235,15 @@ void main() {
       final second = await repo.load();
       expect((second['mailAccounts'] as List).length, 2);
       expect((second['sentEmails'] as List).length, 2);
-      expect(await db.query(migrationsTableName), hasLength(1));
+      expect(await _markerRows(db, 'mail_relational_v1'), 1);
+      expect(await _markerRows(db, 'demo_inbox_relational_v1'), 1);
 
       await repo.save(first);
       await repo.save(second);
-      expect(await db.query(migrationsTableName), hasLength(1));
+      expect(await _markerRows(db, 'mail_relational_v1'), 1);
+      expect(await _markerRows(db, 'demo_inbox_relational_v1'), 1);
       expect(await db.query(OrbitDatabaseSchema.tableAccounts), hasLength(2));
-      expect(await db.query(OrbitDatabaseSchema.tableEmails), hasLength(2));
+      expect(await _userEmailRows(db), 2);
 
       await db.close();
     });
@@ -276,8 +315,8 @@ void main() {
       final db = DriftOrbitDatabase();
       final repo = _repo(_legacyState, db: db);
       final loaded = await repo.load();
-      final markerBefore = await db.query(migrationsTableName);
-      expect(markerBefore, hasLength(1));
+      expect(await _markerRows(db, 'mail_relational_v1'), 1);
+      expect(await _markerRows(db, 'demo_inbox_relational_v1'), 1);
 
       final mutated = <String, Object?>{...loaded}
         ..['draftSubject'] = 'Не должен сохраниться'
@@ -296,9 +335,9 @@ void main() {
       final after = await repo.load();
       expect(after['draftSubject'], 'Отчёт');
       expect((after['mailAccounts'] as List), hasLength(2));
-      expect(await db.query(migrationsTableName), hasLength(1));
+      expect(await _markerRows(db, 'mail_relational_v1'), 1);
       expect(await db.query(OrbitDatabaseSchema.tableAccounts), hasLength(2));
-      expect(await db.query(OrbitDatabaseSchema.tableEmails), hasLength(2));
+      expect(await _userEmailRows(db), 2);
 
       // A failure inside the mail projection stage also rolls everything
       // back, including accounts already written in that transaction.
@@ -322,7 +361,8 @@ void main() {
         isNot(contains('acc-bad-date')),
       );
       expect(await db.query(OrbitDatabaseSchema.tableAccounts), hasLength(2));
-      expect(await db.query(migrationsTableName), hasLength(1));
+      expect(await _markerRows(db, 'mail_relational_v1'), 1);
+      expect(await _markerRows(db, 'demo_inbox_relational_v1'), 1);
 
       await db.close();
     });
@@ -338,14 +378,23 @@ void main() {
       final state = await repo.load();
       expect((state['mailAccounts'] as List), isEmpty);
       expect((state['sentEmails'] as List), isEmpty);
-      expect(await db.query(migrationsTableName), hasLength(1));
+      expect(await _markerRows(db, 'mail_relational_v1'), 1);
       expect(await db.query(OrbitDatabaseSchema.tableAccounts), isEmpty);
-      expect(await db.query(OrbitDatabaseSchema.tableEmails), isEmpty);
+      // STEP4: DEMO projection exists for a non-empty snapshot (empty mail
+      // lists are a valid mail state, not an empty state).
+      expect(await _userEmailRows(db), 0);
+      final demoRows = await db.query(
+        OrbitDatabaseSchema.tableEmails,
+        where: 'source_type = ?',
+        whereArgs: ['demo'],
+      );
+      expect(demoRows, hasLength(5));
 
-      // Repeat: no re-migration, still empty, still one marker.
+      // Repeat: no re-migration, still empty, markers stay single.
       await repo.load();
       await repo.save(state);
-      expect(await db.query(migrationsTableName), hasLength(1));
+      expect(await _markerRows(db, 'mail_relational_v1'), 1);
+      expect(await _markerRows(db, 'demo_inbox_relational_v1'), 1);
       expect(await db.query(OrbitDatabaseSchema.tableAccounts), isEmpty);
 
       // Genuinely empty state stays {}.
@@ -388,7 +437,7 @@ void main() {
           .map((e) => e['id']);
       expect(sentIds, ['sent-2']);
       expect(await db2.query(OrbitDatabaseSchema.tableAccounts), hasLength(1));
-      expect(await db2.query(OrbitDatabaseSchema.tableEmails), hasLength(1));
+      expect(await _userEmailRows(db2), 1);
       await db2.close();
     });
 
@@ -424,7 +473,7 @@ void main() {
           .toList();
       await repo.save(state);
 
-      expect(await db.query(OrbitDatabaseSchema.tableEmails), hasLength(2));
+      expect(await _userEmailRows(db), 2);
       final foreign = await db.query(
         OrbitDatabaseSchema.tableEmails,
         where: 'id = ?',
@@ -625,9 +674,10 @@ void main() {
         expect((state['mailAccounts'] as List).length, 2);
         expect((state['sentEmails'] as List).length, 2);
       }
-      expect(await db.query(migrationsTableName), hasLength(1));
+      expect(await _markerRows(db, 'mail_relational_v1'), 1);
+      expect(await _markerRows(db, 'demo_inbox_relational_v1'), 1);
       expect(await db.query(OrbitDatabaseSchema.tableAccounts), hasLength(2));
-      expect(await db.query(OrbitDatabaseSchema.tableEmails), hasLength(2));
+      expect(await _userEmailRows(db), 2);
       await db.close();
     });
   });

@@ -6,6 +6,7 @@ import 'package:flutter/services.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
+import '../data/demo_data.dart';
 import 'database/drift_orbit_database.dart';
 import 'database/orbit_database.dart';
 import 'orbit_corrupt_data.dart';
@@ -17,14 +18,16 @@ import 'orbit_local_state_repository.dart';
 ///
 /// Storage model:
 /// 1. `app_state_snapshots` (single row id = 1) keeps the FULL JSON snapshot
-///    of the current `Map<String, Object?>` state — every field that is not
-///    normalized yet (drafts, mail state, accounts, brain history and event
-///    decorations like color/time/attendees) survives loss-free here.
-/// 2. The `tasks` and `events` tables hold the relational projection used by
-///    OrbitDataEngine. On [load] the snapshot's `tasks`/`events` entries are
-///    refreshed from those tables (merge by id), so relational data is
-///    authoritative for the columns it owns while legacy-only decorations
-///    stay intact.
+///    of the current `Map<String, Object?>` state — drafts, mail flag/folder
+///    sets, brain history and event decorations survive loss-free here.
+/// 2. Relational projections refreshed from SQLite on [load], authoritative
+///    for their own columns and list composition:
+///    - `tasks`/`events` (STEP2),
+///    - `accounts` and user `sent`/`trash` emails (STEP3),
+///    - built-in `demoEmails` flags/folders with `source_type='demo'`,
+///      including `permanently_deleted` tombstones (STEP4).
+///    Snapshot entries merge by id; legacy-only decorations stay intact and
+///    user-deleted entries never resurrect.
 ///
 /// The legacy SharedPreferences JSON is migrated once on first load and is
 /// never deleted or overwritten afterwards — it remains the backup copy of
@@ -43,6 +46,13 @@ final class DriftLocalStateRepository
 
   /// STEP3 migration marker: mailAccounts/sentEmails relational backfill.
   static const String mailMigrationMarker = 'mail_relational_v1';
+
+  /// STEP4 migration marker: built-in demoEmails flags/folders backfill.
+  static const String demoInboxMigrationMarker = 'demo_inbox_relational_v1';
+
+  /// STEP4 owner column values for the emails projection.
+  static const String sourceTypeUser = 'user';
+  static const String sourceTypeDemo = 'demo';
 
   /// Folders owned by the STEP3 sent projection. Rows with other folders
   /// (future inbox/archive imports) are never touched by this repository.
@@ -122,7 +132,14 @@ final class DriftLocalStateRepository
       // Genuinely empty state stays empty (no synthetic keys).
       return <String, Object?>{};
     }
-    return await _composeState(db, backfilled);
+    // STEP4: first open of a STEP3-era database backfills the DEMO inbox
+    // projection (flags/folders of the built-in demoEmails) and stamps its
+    // own marker, also atomically.
+    final demoBackfilled = await _ensureDemoInboxBackfill(db, backfilled);
+    if (demoBackfilled == null) {
+      return <String, Object?>{};
+    }
+    return await _composeState(db, demoBackfilled);
   }
 
   Map<String, Object?> _decodeSnapshot(String payloadJson) {
@@ -197,6 +214,89 @@ final class DriftLocalStateRepository
     });
   }
 
+  Future<int?> _readMarker(DriftOrbitDatabase db, String name) async {
+    final rows = await db.query(
+      migrationsTableName,
+      where: 'name = ?',
+      whereArgs: [name],
+      limit: 1,
+    );
+    if (rows.isEmpty) return null;
+    return (rows.single['applied_at'] as num?)?.toInt();
+  }
+
+  /// STEP4: one-time backfill of the built-in demoEmails projection. The
+  /// whole pass — snapshot read, decode, DEMO projection, marker — runs in
+  /// one Drift transaction and rolls back on any error. Returns the decoded
+  /// state, or null when the snapshot is genuinely empty (in which case the
+  /// marker is still stamped so the backfill never re-runs).
+  Future<Map<String, Object?>?> _ensureDemoInboxBackfill(
+    DriftOrbitDatabase db,
+    Map<String, Object?> decoded,
+  ) async {
+    final marker = await _readMarker(db, demoInboxMigrationMarker);
+    if (marker != null) {
+      return decoded;
+    }
+    return db.transaction((_) async {
+      final rows = await db.query(
+        snapshotTableName,
+        where: 'id = ?',
+        whereArgs: [snapshotRowId],
+        limit: 1,
+      );
+      if (rows.isEmpty) {
+        return null;
+      }
+      final payload = rows.single['payload_json'] as String?;
+      final state = payload == null ? null : _decodeSnapshot(payload);
+      if (state == null || state.isEmpty) {
+        await _writeDemoMarker(db);
+        return state;
+      }
+      final demoRows = _demoEntriesOf(state);
+      for (final row in demoRows) {
+        await _insertWithEmailOwnership(db, row, sourceTypeDemo);
+      }
+      await _writeDemoMarker(db);
+      return state;
+    });
+  }
+
+  Future<void> _writeDemoMarker(DriftOrbitDatabase db) async {
+    await db.insert(migrationsTableName, {
+      'name': demoInboxMigrationMarker,
+      'applied_at': DateTime.now().millisecondsSinceEpoch,
+    });
+  }
+
+  /// Guard against silently overwriting a row owned by the other projection:
+  /// writing an id that already exists with a different `source_type` is an
+  /// explicit error (and rolls the surrounding transaction back).
+  Future<void> _insertWithEmailOwnership(
+    DriftOrbitDatabase db,
+    Map<String, Object?> row,
+    String expectedSourceType,
+  ) async {
+    final id = row['id'];
+    final existing = await db.query(
+      OrbitDatabaseSchema.tableEmails,
+      where: 'id = ?',
+      whereArgs: [id],
+      limit: 1,
+    );
+    if (existing.isNotEmpty) {
+      final owner = existing.single['source_type'];
+      if (owner is String && owner != expectedSourceType) {
+        throw FormatException(
+          'email id "$id" already exists with source_type "$owner"; '
+          'refusing to overwrite it with "$expectedSourceType"',
+        );
+      }
+    }
+    await db.insert(OrbitDatabaseSchema.tableEmails, row);
+  }
+
   Future<String?> _readSnapshotPayload(DriftOrbitDatabase db) async {
     final rows = await db.query(
       snapshotTableName,
@@ -244,9 +344,16 @@ final class DriftLocalStateRepository
     );
     final relationalMail = await db.query(
       OrbitDatabaseSchema.tableEmails,
-      where: 'workspace_id = ? AND folder IN (?, ?)',
-      whereArgs: [defaultWorkspaceId, ..._ownedSentFolders],
+      where: 'workspace_id = ? AND folder IN (?, ?) AND source_type = ?',
+      whereArgs: [defaultWorkspaceId, ..._ownedSentFolders, sourceTypeUser],
       orderBy: 'timestamp ASC, id ASC',
+    );
+
+    final relationalDemoMail = await db.query(
+      OrbitDatabaseSchema.tableEmails,
+      where: 'workspace_id = ? AND source_type = ?',
+      whereArgs: [defaultWorkspaceId, sourceTypeDemo],
+      orderBy: 'id ASC',
     );
 
     // A genuinely empty state (empty legacy JSON migration) stays empty:
@@ -255,7 +362,8 @@ final class DriftLocalStateRepository
         relationalTasks.isEmpty &&
         relationalEvents.isEmpty &&
         relationalAccounts.isEmpty &&
-        relationalMail.isEmpty) {
+        relationalMail.isEmpty &&
+        relationalDemoMail.isEmpty) {
       return decoded;
     }
     decoded['tasks'] = _mergeTasks(decoded['tasks'], relationalTasks);
@@ -269,7 +377,171 @@ final class DriftLocalStateRepository
       relationalMail,
     );
     decoded['trashEmails'] = _syncTrashSet(decoded['trashEmails'], relationalMail);
+    _restoreDemoFlagFolderSets(decoded, relationalDemoMail);
     return decoded;
+  }
+
+  /// STEP4: rebuilds the JSON flag/folder sets the way [OrbitAppState]
+  /// expects them, using the relational DEMO rows as the authority for the
+  /// known demo ids. Unknown (non-demo) ids in the snapshot sets are kept
+  /// verbatim so future/foreign data is never dropped.
+  static void _restoreDemoFlagFolderSets(
+    Map<String, Object?> state,
+    List<Map<String, Object?>> demoRows,
+  ) {
+    final rowById = <String, Map<String, Object?>>{
+      for (final row in demoRows)
+        if (row['id'] is String) row['id']! as String: row,
+    };
+    final demoById = <String, DemoEmail>{
+      for (final email in demoEmails) email.id: email,
+    };
+
+    List<String> listSet(Object? raw) =>
+        _stringSetOf(raw).toList()..sort();
+
+    final read = <String>{...listSet(state['readEmails'])};
+    final starred = <String>{...listSet(state['starredEmails'])};
+    final unstarred = <String>{...listSet(state['unstarredEmails'])};
+    final trash = <String>{...listSet(state['trashEmails'])};
+    final deleted = <String>{...listSet(state['deletedEmails'])};
+    final spam = <String>{...listSet(state['spamEmails'])};
+    final archive = <String>{...listSet(state['archiveEmails'])};
+    final outbox = <String>{...listSet(state['outboxEmails'])};
+    final permanentlyDeleted = <String>{
+      ...listSet(state['permanentlyDeletedEmails']),
+    };
+
+    // Remove known demo ids from every set first; they are re-added below
+    // from the authoritative relational flags/folders.
+    for (final id in demoById.keys) {
+      read.remove(id);
+      starred.remove(id);
+      unstarred.remove(id);
+      trash.remove(id);
+      deleted.remove(id);
+      spam.remove(id);
+      archive.remove(id);
+      outbox.remove(id);
+      permanentlyDeleted.remove(id);
+    }
+
+    for (final entry in demoById.entries) {
+      final row = rowById[entry.key];
+      if (row == null) continue; // no projection yet — keep snapshot sets
+      final isRead = row['is_read'] is num
+          ? (row['is_read'] as num).toInt() == 1
+          : !entry.value.unread;
+      final isFlagged = row['is_flagged'] is num
+          ? (row['is_flagged'] as num).toInt() == 1
+          : entry.value.starred;
+      final folder = row['folder'];
+
+      // readEmails: only originally-unread demo mails with is_read=1.
+      if (entry.value.unread && isRead) read.add(entry.key);
+      // starred: flagged demo mails whose builtin default is not starred;
+      // unstarred: builtin-starred mails whose flag was cleared.
+      if (isFlagged && !entry.value.starred) starred.add(entry.key);
+      if (!isFlagged && entry.value.starred) unstarred.add(entry.key);
+
+      switch (folder) {
+        case 'trash':
+          trash.add(entry.key);
+          deleted.add(entry.key); // legacy mirror of Trash
+        case 'spam':
+          spam.add(entry.key);
+        case 'archive':
+          archive.add(entry.key);
+        case 'outbox':
+          outbox.add(entry.key);
+        case 'permanently_deleted':
+          permanentlyDeleted.add(entry.key);
+        case 'inbox':
+          break;
+        default:
+          break;
+      }
+    }
+
+    state['readEmails'] = read.toList()..sort();
+    state['starredEmails'] = starred.toList()..sort();
+    state['unstarredEmails'] = unstarred.toList()..sort();
+    state['trashEmails'] = trash.toList()..sort();
+    state['deletedEmails'] = deleted.toList()..sort();
+    state['spamEmails'] = spam.toList()..sort();
+    state['archiveEmails'] = archive.toList()..sort();
+    state['outboxEmails'] = outbox.toList()..sort();
+    state['permanentlyDeletedEmails'] = permanentlyDeleted.toList()..sort();
+  }
+
+  /// STEP4: built-in demoEmails → emails rows with `source_type='demo'`.
+  /// Folder/flags formulas follow the OrbitAppState semantics literally;
+  /// `timestamp` is deterministically 0 (DemoEmail.time has no date).
+  List<Map<String, Object?>> _demoEntriesOf(Map<String, Object?> state) {
+    final readSet = _stringSetOf(state['readEmails']);
+    final starredSet = _stringSetOf(state['starredEmails']);
+    final unstarredSet = _stringSetOf(state['unstarredEmails']);
+    final trashSet = _stringSetOf(state['trashEmails']);
+    final deletedSet = _stringSetOf(state['deletedEmails']);
+    final spamSet = _stringSetOf(state['spamEmails']);
+    final archiveSet = _stringSetOf(state['archiveEmails']);
+    final outboxSet = _stringSetOf(state['outboxEmails']);
+    final permanentSet = _stringSetOf(state['permanentlyDeletedEmails']);
+
+    Map<String, Object?>? activeAccount;
+    for (final item in (state['mailAccounts'] as List<Object?>? ?? const [])) {
+      if (item is Map<String, Object?> && item['isActive'] == true) {
+        activeAccount = item;
+        break;
+      }
+    }
+    final activeId = activeAccount?['id'] as String?;
+    final activeEmail = activeAccount?['email'] as String?;
+
+    final entries = <Map<String, Object?>>[];
+    for (final email in demoEmails) {
+      // Effective flags, per OrbitAppState semantics:
+      // isRead  = !email.unread || readEmails.contains(id)
+      // isStarred = starredEmails.contains(id)
+      //             || (email.starred && !unstarredEmails.contains(id))
+      final isRead = !email.unread || readSet.contains(email.id);
+      final isStarred =
+          starredSet.contains(email.id) ||
+          (email.starred && !unstarredSet.contains(email.id));
+
+      // Effective folder priority: permanent → trash/deleted → spam →
+      // archive → outbox → inbox.
+      String folder = 'inbox';
+      if (permanentSet.contains(email.id)) {
+        folder = 'permanently_deleted';
+      } else if (trashSet.contains(email.id) || deletedSet.contains(email.id)) {
+        folder = 'trash';
+      } else if (spamSet.contains(email.id)) {
+        folder = 'spam';
+      } else if (archiveSet.contains(email.id)) {
+        folder = 'archive';
+      } else if (outboxSet.contains(email.id)) {
+        folder = 'outbox';
+      }
+
+      entries.add(<String, Object?>{
+        'id': email.id,
+        'workspace_id': defaultWorkspaceId,
+        'account_id': activeId,
+        'folder': folder,
+        'sender': email.email,
+        'recipient': activeEmail ?? '',
+        'subject': email.subject,
+        'preview': email.preview,
+        'body': email.body,
+        'timestamp': 0,
+        'is_read': isRead ? 1 : 0,
+        'is_flagged': isStarred ? 1 : 0,
+        'has_attachments': email.attachments.isNotEmpty ? 1 : 0,
+        'source_type': sourceTypeDemo,
+      });
+    }
+    return entries;
   }
 
   static List<Object?> _mergeTasks(
@@ -512,18 +784,20 @@ final class DriftLocalStateRepository
         }
       }
 
-      // 5. STEP3 mail projection: accounts + sent/trash emails.
+      // 5. STEP3 mail projection: accounts + user sent/trash emails.
       final accountRows = _accountEntriesOf(state);
       for (final row in accountRows) {
         await db.insert(OrbitDatabaseSchema.tableAccounts, row);
       }
       final sentRows = _sentEntriesOf(state);
       for (final row in sentRows) {
-        await db.insert(OrbitDatabaseSchema.tableEmails, row);
+        await _insertWithEmailOwnership(db, row, sourceTypeUser);
       }
 
-      // 6. Scoped sync deletions for the mail projection: only rows of the
-      // sent/trash projection disappear; other email folders stay.
+      // 6. Scoped sync deletions for the mail projection, split by owner:
+      // user deletion touches only user sent/trash rows; DEMO rows are
+      // never removed by it (their set is static) and DEMO writes never
+      // remove user rows.
       final keepAccountIds = accountRows.map((e) => e['id']).toSet();
       for (final row in await db.query(
         OrbitDatabaseSchema.tableAccounts,
@@ -542,8 +816,8 @@ final class DriftLocalStateRepository
       final keepMailIds = sentRows.map((e) => e['id']).toSet();
       for (final row in await db.query(
         OrbitDatabaseSchema.tableEmails,
-        where: 'workspace_id = ? AND folder IN (?, ?)',
-        whereArgs: [defaultWorkspaceId, ..._ownedSentFolders],
+        where: 'workspace_id = ? AND folder IN (?, ?) AND source_type = ?',
+        whereArgs: [defaultWorkspaceId, ..._ownedSentFolders, sourceTypeUser],
       )) {
         final id = row['id'];
         if (id is String && !keepMailIds.contains(id)) {
@@ -555,8 +829,18 @@ final class DriftLocalStateRepository
         }
       }
 
-      // 7. Stamp the STEP3 marker atomically with everything above.
+      // 7. STEP4 DEMO projection, including permanently_deleted tombstones.
+      // A genuinely empty state creates no DEMO rows.
+      if (state.isNotEmpty) {
+        final demoRows = _demoEntriesOf(state);
+        for (final row in demoRows) {
+          await _insertWithEmailOwnership(db, row, sourceTypeDemo);
+        }
+      }
+
+      // 8. Stamp both step markers atomically with everything above.
       await _writeMailMarker(db);
+      await _writeDemoMarker(db);
     });
   }
 
@@ -701,6 +985,7 @@ final class DriftLocalStateRepository
         'is_read': 1,
         'is_flagged': ((item['isImportant'] as bool?) ?? false) ? 1 : 0,
         'has_attachments': 0,
+        'source_type': sourceTypeUser,
       });
     }
     return entries;
@@ -916,13 +1201,20 @@ final class DriftLocalStateRepository
       );
       await db.delete(
         OrbitDatabaseSchema.tableEmails,
-        where: 'workspace_id = ? AND folder IN (?, ?)',
-        whereArgs: [defaultWorkspaceId, ..._ownedSentFolders],
+        where: 'workspace_id = ? AND folder IN (?, ?) AND source_type = ?',
+        whereArgs: [defaultWorkspaceId, ..._ownedSentFolders, sourceTypeUser],
+      );
+      // STEP4: clear the DEMO projection and both markers (Drift-only;
+      // foreign user rows outside the sent projection are not deleted).
+      await db.delete(
+        OrbitDatabaseSchema.tableEmails,
+        where: 'workspace_id = ? AND source_type = ?',
+        whereArgs: [defaultWorkspaceId, sourceTypeDemo],
       );
       await db.delete(
         migrationsTableName,
-        where: 'name = ?',
-        whereArgs: [mailMigrationMarker],
+        where: 'name = ? OR name = ?',
+        whereArgs: [mailMigrationMarker, demoInboxMigrationMarker],
       );
     });
     _migrationAttempted = false;
