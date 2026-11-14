@@ -4,6 +4,8 @@ import 'package:orbit_visual_lab/services/mail/mail_connection_verifier.dart';
 import 'package:orbit_visual_lab/state/app_state.dart';
 
 void main() {
+  // MAIL-01A: secure-flow тесты требуют test binding (platform channel).
+  TestWidgetsFlutterBinding.ensureInitialized();
   group('OrbitMailConnectionVerifier', () {
     final verifier = OrbitMailConnectionVerifier();
 
@@ -154,7 +156,8 @@ void main() {
       appState.addMailAccount(acc2);
       expect(appState.activeMailAccount.id, 'acc-to-delete');
 
-      appState.removeMailAccount('acc-to-delete');
+      // MAIL-01A: metadata-only bypass удалён — secure flow.
+      await appState.removeMailAccountSecurely('acc-to-delete');
       expect(appState.mailAccounts.any((a) => a.id == 'acc-to-delete'), isFalse);
       expect(appState.activeMailAccount.id, 'demo-default');
     });

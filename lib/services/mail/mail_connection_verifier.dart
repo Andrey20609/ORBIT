@@ -178,6 +178,7 @@ final class OrbitMailAccount {
     OrbitMailAccountStatus? status,
     OrbitMailCredentialStatus? credentialStatus,
     String? authMethod,
+    bool clearAuthMethod = false,
     bool? isDemo,
     String? lastError,
   }) {
@@ -203,7 +204,9 @@ final class OrbitMailAccount {
       isActive: isActive ?? this.isActive,
       status: status ?? this.status,
       credentialStatus: credentialStatus ?? this.credentialStatus,
-      authMethod: authMethod ?? this.authMethod,
+      // MAIL-01A fix: nullable authMethod нельзя очистить через
+      // `authMethod ?? this.authMethod` — явный флаг clearAuthMethod.
+      authMethod: clearAuthMethod ? null : (authMethod ?? this.authMethod),
       isDemo: isDemo ?? this.isDemo,
       lastError: lastError ?? this.lastError,
     );

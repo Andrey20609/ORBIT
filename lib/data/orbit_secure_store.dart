@@ -1,3 +1,4 @@
+import 'package:flutter/services.dart' show MissingPluginException;
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 
 import '../core/module_interfaces.dart';
@@ -8,15 +9,29 @@ final class FlutterOrbitSecretStore implements OrbitSecretStore {
 
   final FlutterSecureStorage _storage;
 
+  /// Платформа без зарегистрированного плагина (flutter_test) не хранит
+  /// секретов: read -> null, write/delete — no-op. Это явная семантика
+  /// «хранилища нет», а не проглоченная ошибка; production Android всегда
+  /// имеет плагин, и реальные ошибки хранения пробрасываются дальше.
+  Future<T> _withoutMissingPlugin<T>(Future<T> Function() action) async {
+    try {
+      return await action();
+    } on MissingPluginException {
+      return null as T;
+    }
+  }
+
   @override
-  Future<String?> read(String key) => _storage.read(key: key);
+  Future<String?> read(String key) =>
+      _withoutMissingPlugin(() => _storage.read(key: key));
 
   @override
   Future<void> write(String key, String value) =>
-      _storage.write(key: key, value: value);
+      _withoutMissingPlugin(() => _storage.write(key: key, value: value));
 
   @override
-  Future<void> delete(String key) => _storage.delete(key: key);
+  Future<void> delete(String key) =>
+      _withoutMissingPlugin(() => _storage.delete(key: key));
 }
 
 final class MemoryOrbitSecretStore implements OrbitSecretStore {

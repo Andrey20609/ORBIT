@@ -158,17 +158,6 @@ final class OrbitAppState extends ChangeNotifier {
     _changed();
   }
 
-  void removeMailAccount(String id) {
-    final index = _mailAccounts.indexWhere((a) => a.id == id);
-    if (index != -1) {
-      final wasActive = _mailAccounts[index].isActive;
-      _mailAccounts.removeAt(index);
-      if (wasActive && _mailAccounts.isNotEmpty) {
-        _mailAccounts[0] = _mailAccounts[0].copyWith(isActive: true);
-      }
-      _changed();
-    }
-  }
 
   void setActiveMailAccount(String id) {
     var found = false;
@@ -295,42 +284,73 @@ final class OrbitAppState extends ChangeNotifier {
 
   /// MAIL-01A: удалить аккаунт с гарантиями против orphan-секретов.
   ///
-  /// - secure delete падает → операция прерывается, metadata остаётся,
+  /// - удаление из памяти применяется синхронно (UI отражает сразу), но
+  ///   PERSIST откладывается до успешного secure delete: крах между шагами
+  ///   оставляет аккаунт в snapshot (без orphan-секрета) и load()
+  ///   приводит metadata к согласованному состоянию;
+  /// - secure delete падает → metadata восстанавливается без изменений,
   ///   sanitized error;
   /// - секрет удалён, metadata delete упал → секрет НЕ восстанавливается
-  ///   (orphan secret не создаётся), аккаунт остаётся в списке как
-  ///   `notConfigured`, ошибка явная.
+  ///   (orphan secret не создаётся); скомпенсированное `notConfigured` +
+  ///   `authMethod = null` сохраняется в память И в snapshot (повторная
+  ///   ошибка сохранения допускается — согласованность гарантирует
+  ///   reconciliation при следующем load, см. load()).
   Future<void> removeMailAccountSecurely(String id) async {
     final index = _mailAccounts.indexWhere((a) => a.id == id);
     if (index == -1) return;
     final removed = _mailAccounts[index];
+    final wasActive = removed.isActive;
 
-    // 1. Секрет сначала; падение — отмена всей операции.
-    await _credentials.deleteAppPassword(id);
-
-    // 2. Metadata removal + flush.
+    // 1. Синхронное удаление из памяти (без persist).
     _mailAccounts.removeAt(index);
-    if (removed.isActive && _mailAccounts.isNotEmpty) {
+    if (wasActive && _mailAccounts.isNotEmpty) {
       _mailAccounts[0] = _mailAccounts[0].copyWith(isActive: true);
     }
-    _changed();
+    _notify();
+
+    // 2. Secure delete. Падение → metadata восстанавливается как была.
     try {
-      await flush();
-    } catch (_) {
-      // 3. Metadata не удалились: возвращаем аккаунт как notConfigured
-      // (секрет уже удалён — orphan secret не создаётся и не восстанавливается).
-      final restoredIndex = index.clamp(0, _mailAccounts.length);
+      await _credentials.deleteAppPassword(id);
+    } on OrbitMailCredentialException {
       _mailAccounts.insert(
-        restoredIndex,
-        removed.copyWith(
-          credentialStatus: OrbitMailCredentialStatus.notConfigured,
-          authMethod: null,
-        ),
+        index.clamp(0, _mailAccounts.length),
+        removed,
       );
       if (!_mailAccounts.any((a) => a.isActive) && _mailAccounts.isNotEmpty) {
         _mailAccounts[0] = _mailAccounts[0].copyWith(isActive: true);
       }
       _notify();
+      rethrow;
+    }
+
+    // 3. Persist удаления.
+    _changed();
+    try {
+      await flush();
+    } catch (_) {
+      // 4. Metadata delete упал, секрет уже удалён: приводим metadata к
+      // согласованному состоянию (notConfigured, authMethod = null) в
+      // памяти И пытаемся сохранить это в snapshot; повторная ошибка
+      // сохранения допускается — load() пересчитывает effective status
+      // по фактическому наличию секрета.
+      final restoredIndex = index.clamp(0, _mailAccounts.length);
+      _mailAccounts.insert(
+        restoredIndex,
+        removed.copyWith(
+          credentialStatus: OrbitMailCredentialStatus.notConfigured,
+          clearAuthMethod: true,
+        ),
+      );
+      if (!_mailAccounts.any((a) => a.isActive) && _mailAccounts.isNotEmpty) {
+        _mailAccounts[0] = _mailAccounts[0].copyWith(isActive: true);
+      }
+      _changed();
+      try {
+        await flush();
+      } catch (_) {
+        // Повторная ошибка: рассогласование на диске устранит
+        // reconciliation при следующем load.
+      }
       throw const OrbitMailCredentialException(
         'Не удалось удалить аккаунт из локальных данных. Пароль приложения '
         'уже удалён; аккаунт помечен как «Пароль не настроен»',
@@ -624,6 +644,34 @@ final class OrbitAppState extends ChangeNotifier {
       _mailAccounts
         ..clear()
         ..addAll(mailAccountsRaw.isNotEmpty ? mailAccountsRaw : initialMailAccounts);
+      // MAIL-01A fix: reconcile credential metadata against the ACTUAL
+      // secret presence in secure storage. A stale snapshot (e.g. after a
+      // metadata-delete failure) must never resurrect «savedUnverified»
+      // without a secret; a secure-storage read error is handled
+      // explicitly — no false states, reconciliation retries on the next
+      // successful load.
+      var credentialsReconciled = false;
+      for (var i = 0; i < _mailAccounts.length; i++) {
+        final account = _mailAccounts[i];
+        if (account.isDemo ||
+            account.credentialStatus ==
+                OrbitMailCredentialStatus.notConfigured) {
+          continue;
+        }
+        final bool hasSecret;
+        try {
+          hasSecret = await _credentials.hasAppPassword(account.id);
+        } on OrbitMailCredentialException {
+          continue;
+        }
+        if (!hasSecret) {
+          _mailAccounts[i] = account.copyWith(
+            credentialStatus: OrbitMailCredentialStatus.notConfigured,
+            clearAuthMethod: true,
+          );
+          credentialsReconciled = true;
+        }
+      }
       final chatRaw = (state['brainChatHistory'] as List<Object?>? ?? const [])
           .whereType<Map<String, Object?>>()
           .map(BrainChatMessage.fromJson)
@@ -635,6 +683,11 @@ final class OrbitAppState extends ChangeNotifier {
       _lastSavedDraft = _draft;
       _loadStatus = OrbitLoadStatus.loaded;
       lastLoadError = null;
+      if (credentialsReconciled) {
+        // Persist the reconciled credential metadata so the snapshot never
+        // carries a «saved» status without a secret.
+        _persist();
+      }
     } catch (error) {
       _loadStatus = error is OrbitCorruptDataException
           ? OrbitLoadStatus.corrupt

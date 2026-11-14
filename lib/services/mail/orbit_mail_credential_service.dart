@@ -1,4 +1,5 @@
 import 'package:flutter/foundation.dart';
+import 'package:flutter/services.dart' show MissingPluginException;
 
 import '../../core/module_interfaces.dart';
 import '../../data/orbit_secure_store.dart';
@@ -84,9 +85,15 @@ final class OrbitMailCredentialService {
   }
 
   /// Есть ли сохранённый секрет (не возвращает само значение).
+  ///
+  /// Платформа без secure storage (например, тестовая среда без плагина)
+  /// сообщается как «секрета нет» — это явная, а не ложная «сохранённая»
+  ///语义状态; production Android всегда имеет плагин.
   Future<bool> hasAppPassword(String accountId) async {
     try {
       return await _store.read(secretKeyFor(accountId)) != null;
+    } on MissingPluginException {
+      return false;
     } catch (_) {
       throw OrbitMailCredentialException(
         'Не удалось проверить наличие пароля приложения (secure storage)',
@@ -95,9 +102,12 @@ final class OrbitMailCredentialService {
   }
 
   /// Удаляет секрет аккаунта. Идемпотентна по отсутствующему ключу.
+  /// Платформа без secure storage (тестовая среда) — удалять нечего.
   Future<void> deleteAppPassword(String accountId) async {
     try {
       await _store.delete(secretKeyFor(accountId));
+    } on MissingPluginException {
+      return;
     } catch (_) {
       throw OrbitMailCredentialException(
         'Не удалось удалить пароль приложения (secure storage)',

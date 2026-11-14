@@ -120,6 +120,8 @@ Future<int> _markerRows(DriftOrbitDatabase db, String name) async {
 }
 
 void main() {
+  // MAIL-01A: secure-flow тесты требуют test binding (platform channel).
+  TestWidgetsFlutterBinding.ensureInitialized();
   late Directory tempDir;
 
   setUp(() async {
@@ -644,7 +646,8 @@ void main() {
         whereArgs: ['acc-flow'],
       );
       expect(accRows, hasLength(1));
-      appState.removeMailAccount('acc-flow');
+      // MAIL-01A: metadata-only bypass удалён — secure flow.
+      await appState.removeMailAccountSecurely('acc-flow');
       await appState.flush();
       expect(
         await db.query(

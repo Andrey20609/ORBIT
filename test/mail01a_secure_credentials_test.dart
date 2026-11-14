@@ -680,6 +680,93 @@ void main() {
       // отдельное поле и остаётся notConfigured несмотря на verified.
     });
 
+    test('[C13] regression (Kimi scenario): metadata delete failure -> '
+        'close/reopen реальной SQLite -> notConfigured + authMethod null + '
+        'секрет отсутствует', () async {
+      final tempDir = await Directory.systemTemp.createTemp('mail01a_c13');
+      final dbFile = File(
+        '${tempDir.path}${Platform.pathSeparator}state.db',
+      );
+      var tempDirDeleted = false;
+      Future<void> cleanupTempDir() async {
+        if (tempDirDeleted) return;
+        tempDirDeleted = true;
+        try {
+          await tempDir.delete(recursive: true);
+        } on FileSystemException {
+          // Windows может удерживать файл короткое время после close —
+          // временный каталог не влияет на другие тесты.
+        }
+      }
+
+      addTearDown(cleanupTempDir);
+      final store = MemoryOrbitSecretStore();
+      SharedPreferences.setMockInitialValues(<String, Object>{});
+      final legacy = SharedPreferencesLocalStateRepository();
+      final db1 = DriftOrbitDatabase(file: dbFile);
+
+      final appState1 = OrbitAppState(_driftRepo(legacy, db: db1), store);
+      await appState1.load();
+      await appState1.saveMailAccountWithCredentials(
+        _canaryAccount(id: 'acc_c13'),
+        appPassword: _canary,
+      );
+      await appState1.flush();
+      final saved = appState1.mailAccounts
+          .firstWhere((a) => a.id == 'acc_c13');
+      expect(saved.credentialStatus,
+          OrbitMailCredentialStatus.savedUnverified);
+
+      // Метаданные удаляются с искусственным сбоем (rollback транзакции
+      // в drift-репозитории — как в regression-сценарии Kimi): secure
+      // delete успевает удалить секрет (memory store), metadata
+      // delete/flush падает.
+      (appState1.repository as DriftLocalStateRepository)
+          .failNextSaveMidTransaction = true;
+      Object? caught;
+      try {
+        await appState1.removeMailAccountSecurely('acc_c13');
+      } catch (e) {
+        caught = e;
+      }
+      expect(caught, isA<OrbitMailCredentialException>());
+      // Секрет удалён корректно.
+      expect(
+        await store.read('mail.v1.acc_c13.appPassword'),
+        isNull,
+      );
+      // Память скомпенсирована: notConfigured без authMethod.
+      final compensated = appState1.mailAccounts
+          .firstWhere((a) => a.id == 'acc_c13');
+      expect(compensated.credentialStatus,
+          OrbitMailCredentialStatus.notConfigured);
+      expect(compensated.authMethod, isNull);
+
+      // Restart на УСТАРЕВШЕМ snapshot (на диске всё ещё savedUnverified):
+      // load обязан выполнить reconciliation по фактическому наличию
+      // секрета.
+      final db2 = DriftOrbitDatabase(file: dbFile);
+      final repository2 = _driftRepo(legacy, db: db2);
+      final appState2 = OrbitAppState(repository2, store);
+      await appState2.load();
+
+      final restored = appState2.mailAccounts
+          .firstWhere((a) => a.id == 'acc_c13');
+      expect(restored.credentialStatus,
+          OrbitMailCredentialStatus.notConfigured,
+          reason: 'savedUnverified не должен возвращаться без секрета');
+      expect(restored.authMethod, isNull);
+      expect(
+        await store.read('mail.v1.acc_c13.appPassword'),
+        isNull,
+      );
+      // Согласованный snapshot сохранён (reconciliation persists).
+      final snapshotJson = jsonEncode(await repository2.load());
+      expect(snapshotJson.contains('savedUnverified'), isFalse);
+      await db2.close();
+      await cleanupTempDir();
+    });
+
     test('[C12] no network: credential операции не вызывают verifyEndpoint',
         () async {
       final store = MemoryOrbitSecretStore();
