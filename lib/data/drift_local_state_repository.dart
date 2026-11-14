@@ -103,6 +103,10 @@ final class DriftLocalStateRepository
     return OrbitDataEngine(db);
   }
 
+  /// MAIL-02B: та же production SQLite для персистентного SMTP-outbox
+  /// (таблица smtp_outbox создаётся additively при открытии базы).
+  Future<OrbitDatabase> outboxDatabase() async => _store;
+
   /// Resolves the production SQLite file location (application support
   /// directory; sqlite3_flutter_libs provides the native engine on Android).
   static Future<File> _defaultDatabaseFile() async {

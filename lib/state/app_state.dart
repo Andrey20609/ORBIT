@@ -17,6 +17,8 @@ import '../services/mail/mail_connection_verifier.dart';
 import '../services/mail/mail_models.dart';
 import '../services/mail/orbit_mail_credential_service.dart';
 import '../services/mail/orbit_mail_oauth_service.dart';
+import '../services/mail/smtp_mail_transport.dart';
+import '../services/mail/smtp_outbox_store.dart';
 import 'draft_state.dart';
 
 final class OrbitAppState extends ChangeNotifier {
@@ -823,6 +825,287 @@ final class OrbitAppState extends ChangeNotifier {
       ..clear()
       ..addAll(rows.map(UserInboxEntry.fromRow));
     _notify();
+  }
+
+  // ===== MAIL-02B: контролируемая SMTP-отправка + персистентный outbox =====
+
+  SmtpSendConfig _smtpSendConfig = SmtpSendConfig.fromEnvironment();
+  SmtpMailTransport? _smtpTransportOverride;
+  bool _smtpFlushInProgress = false;
+  final List<SmtpOutboxRecord> _smtpOutboxEntries = <SmtpOutboxRecord>[];
+
+  /// MAIL-02B: test hook — подмена конфигурации разрешённых получателей
+  /// (dart-define ORBIT_SMTP_ALLOWED_RECIPIENT в production).
+  @visibleForTesting
+  void debugSmtpConfigForTest(SmtpSendConfig config) {
+    _smtpSendConfig = config;
+  }
+
+  /// MAIL-02B: test hook — подмена SMTP-транспорта (fake socket с
+  /// protocol capture). Production использует SmtpSendClient.connect
+  /// (implicit TLS 465).
+  @visibleForTesting
+  void debugSmtpTransportForTest(SmtpMailTransport transport) {
+    _smtpTransportOverride = transport;
+  }
+
+  SmtpSendConfig get smtpSendConfig => _smtpSendConfig;
+
+  /// Записи персистентного outbox для UI (статусы/ошибки sanitized).
+  List<SmtpOutboxRecord> get smtpOutboxEntries =>
+      List<SmtpOutboxRecord>.unmodifiable(_smtpOutboxEntries);
+
+  /// Итог контролируемой отправки: sanitized, без секретов.
+  SmtpSendOutcome _lastSmtpSendOutcome = const SmtpSendOutcome.rejected(
+    'Отправка не выполнялась',
+  );
+  SmtpSendOutcome get lastSmtpSendOutcome => _lastSmtpSendOutcome;
+
+  /// Контролируемая отправка (ТЗ MAIL-02B):
+  /// - получатель строго из allowlist конфигурации; без конфигурации —
+  ///   честный CONFIG_REQUIRED (ничего не ставится в очередь);
+  /// - идемпотентность: та же пара (account, recipient, subject, body)
+  ///   в любом активном статусе (queued/sending/sent) не дублируется;
+  /// - запись попадает в персистентный outbox (production SQLite), затем
+  ///   выполняется flush (отправка ровно один раз либо retry по ТЗ).
+  Future<SmtpSendOutcome> sendRealEmail({
+    required String to,
+    required String subject,
+    required String body,
+  }) async {
+    if (!_smtpSendConfig.isConfigured) {
+      return _lastSmtpSendOutcome = const SmtpSendOutcome.rejected(
+        'Контролируемая отправка не настроена: задайте тестовый адрес '
+        'получателя',
+      );
+    }
+    final recipient = to.trim().toLowerCase();
+    if (!_smtpSendConfig.allows(recipient)) {
+      return _lastSmtpSendOutcome = const SmtpSendOutcome.rejected(
+        'Получатель вне разрешённого списка контролируемой отправки',
+      );
+    }
+    final account = _activeNonDemoAccount();
+    if (account == null) {
+      return _lastSmtpSendOutcome = const SmtpSendOutcome.rejected(
+        'Нет настроенного реального аккаунта с учётными данными',
+      );
+    }
+    final repository = _repository;
+    if (repository is! DriftLocalStateRepository) {
+      return _lastSmtpSendOutcome = const SmtpSendOutcome.rejected(
+        'Отправка требует production-хранилища',
+      );
+    }
+    final store = SmtpOutboxStore(await repository.outboxDatabase());
+    // Идемпотентность: то же письмо (account+recipient+subject+body) в
+    // ЛЮБОМ статусе не ставится в очередь повторно.
+    final existing = await store.all();
+    for (final record in existing) {
+      if (record.accountId == account.id &&
+          record.recipient == recipient &&
+          record.subject == subject &&
+          record.body == body) {
+        return _lastSmtpSendOutcome = SmtpSendOutcome.duplicate(
+          'Такое письмо уже есть в очереди/отправлено',
+          record.id,
+          record.status,
+        );
+      }
+    }
+    final id =
+        'smtp-${account.id}-${DateTime.now().microsecondsSinceEpoch}';
+    await store.upsert(
+      SmtpOutboxRecord(
+        id: id,
+        workspaceId: 'workspace-work',
+        accountId: account.id,
+        recipient: recipient,
+        subject: subject,
+        body: body,
+        createdAtMs: DateTime.now().millisecondsSinceEpoch,
+        status: outboxStatusQueued,
+        retryCount: 0,
+      ),
+    );
+    await flushSmtpOutbox();
+    final finalRecord = await store.byId(id);
+    final status = finalRecord?.status ?? outboxStatusQueued;
+    return _lastSmtpSendOutcome = SmtpSendOutcome.delivered(
+      status: status,
+      message: switch (status) {
+        outboxStatusSent => 'Письмо принято сервером',
+        outboxStatusQueued => 'Письмо в очереди: будет повторено',
+        outboxStatusFailed =>
+          'Отправка не удалась: ${finalRecord?.lastError ?? 'ошибка'}',
+        _ => 'Письмо в очереди',
+      },
+      recordId: id,
+    );
+  }
+
+  /// Flush персистентного outbox (retry после restart при сетевых сбоях).
+  ///
+  /// Идемпотентность (ТЗ):
+  /// - leftover `sending` (crash/restart во время полёта) переводится в
+  ///   failed БЕЗ повторной отправки — письмо могло быть принято
+  ///   сервером; дубликат исключён;
+  /// - `sent` не переотправляется никогда;
+  /// - точка принятия: true только после 250 на DATA.
+  /// Retry: transient-ошибки -> queued (retry_count+1, максимум
+  /// [smtpMaxRetries]); auth/constant -> failed. Секреты/заголовки
+  /// авторизации в ошибках и логах отсутствуют (sanitized).
+  Future<int> flushSmtpOutbox() async {
+    final repository = _repository;
+    if (repository is! DriftLocalStateRepository) return 0;
+    if (_smtpFlushInProgress) return 0; // без параллельных flush
+    _smtpFlushInProgress = true;
+    try {
+      final store = SmtpOutboxStore(await repository.outboxDatabase());
+      // Leftover in-flight с прошлого процесса: НЕ переотправлять.
+      final inFlight = await store.byStatus(outboxStatusSending);
+      for (final record in inFlight) {
+        await store.updateStatus(
+          record.id,
+          outboxStatusFailed,
+          lastError:
+              'Прервано во время отправки: возможна доставка, повтор '
+              'не выполняется (защита от дубликатов)',
+        );
+      }
+      final pending = await store.byStatus(outboxStatusQueued);
+      if (pending.isEmpty) return 0;
+      final transport =
+          _smtpTransportOverride ??
+          SmtpMailTransport(
+            resolveAccount: (id) async {
+              final i = _mailAccounts.indexWhere((a) => a.id == id);
+              return i == -1 ? null : _mailAccounts[i];
+            },
+            resolveAccessToken: (target) =>
+                getValidOAuthAccessToken(target.id),
+            credentialService: _credentials,
+            sendConfig: _smtpSendConfig,
+          );
+      var sentCount = 0;
+      for (final record in pending) {
+        if (_smtpOutboxCancelRequested) break;
+        await store.updateStatus(record.id, outboxStatusSending);
+        var accepted = false;
+        SmtpTransportException? failure;
+        try {
+          accepted = await transport.sendEmail(
+            QueuedOutgoingEmail(
+              id: record.id,
+              workspaceId: record.workspaceId,
+              accountId: record.accountId,
+              to: record.recipient,
+              subject: record.subject,
+              body: record.body,
+              createdAt: DateTime.fromMillisecondsSinceEpoch(
+                record.createdAtMs,
+              ),
+            ),
+          );
+        } on SmtpTransportException catch (error) {
+          failure = error;
+        } catch (_) {
+          // Sanitized: неизвестная ошибка трактуется как transient.
+          failure = const SmtpTransportException(
+            'Отправка не выполнена',
+            isTransient: true,
+          );
+        }
+        if (accepted) {
+          await store.updateStatus(
+            record.id,
+            outboxStatusSent,
+            sentAtMs: DateTime.now().millisecondsSinceEpoch,
+          );
+          sentCount++;
+          continue;
+        }
+        final transient = failure?.isTransient ?? false;
+        final authRelated = failure?.isAuthRelated ?? false;
+        if (transient && !authRelated && record.retryCount < smtpMaxRetries) {
+          await store.updateStatus(
+            record.id,
+            outboxStatusQueued,
+            retryCount: record.retryCount + 1,
+            lastError: failure?.message ?? 'Сетевая ошибка',
+          );
+        } else {
+          await store.updateStatus(
+            record.id,
+            outboxStatusFailed,
+            retryCount: record.retryCount + 1,
+            lastError:
+                failure?.message ??
+                (authRelated
+                    ? 'Сервер отклонил аутентификацию'
+                    : 'Сервер отклонил письмо'),
+          );
+          // Консистентно с MAIL-02A: отклонение аутентификации сервером
+          // -> персистентно notConfigured + authMethod очищен (без цикла).
+          if (authRelated) {
+            final idx = _mailAccounts.indexWhere(
+              (a) => a.id == record.accountId,
+            );
+            if (idx != -1 &&
+                _mailAccounts[idx].credentialStatus !=
+                    OrbitMailCredentialStatus.notConfigured) {
+              _mailAccounts[idx] = _mailAccounts[idx].copyWith(
+                credentialStatus: OrbitMailCredentialStatus.notConfigured,
+                clearAuthMethod: true,
+              );
+              _changed();
+              await flush();
+            }
+          }
+        }
+      }
+      await refreshSmtpOutboxEntries();
+      return sentCount;
+    } finally {
+      _smtpFlushInProgress = false;
+      _smtpOutboxCancelRequested = false;
+    }
+  }
+
+  bool _smtpOutboxCancelRequested = false;
+
+  /// ТЗ: лимит повторов одной записи.
+  static const int smtpMaxRetries = 3;
+
+  /// Перечитывает outbox для UI.
+  Future<void> refreshSmtpOutboxEntries() async {
+    final repository = _repository;
+    if (repository is! DriftLocalStateRepository) return;
+    final store = SmtpOutboxStore(await repository.outboxDatabase());
+    _smtpOutboxEntries
+      ..clear()
+      ..addAll(await store.all());
+    _notify();
+  }
+
+  /// Активный не-демо аккаунт с настроенными credential (или null).
+  OrbitMailAccount? _activeNonDemoAccount() {
+    for (final account in _mailAccounts) {
+      if (account.isDemo) continue;
+      if (account.credentialStatus ==
+          OrbitMailCredentialStatus.notConfigured) {
+        continue;
+      }
+      if (account.isActive) return account;
+    }
+    for (final account in _mailAccounts) {
+      if (!account.isDemo &&
+          account.credentialStatus !=
+              OrbitMailCredentialStatus.notConfigured) {
+        return account;
+      }
+    }
+    return null;
   }
 
   List<BrainChatMessage> get brainChatHistory =>

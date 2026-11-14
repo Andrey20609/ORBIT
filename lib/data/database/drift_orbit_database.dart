@@ -51,6 +51,7 @@ final class DriftOrbitDatabase implements OrbitDatabase {
       OrbitDatabaseSchema.tableFiles,
       snapshotTableName,
       migrationsTableName,
+      outboxTableName,
     };
     if (!known.contains(table)) {
       throw ArgumentError.value(table, 'table', 'Unknown ORBIT table');
@@ -62,6 +63,19 @@ final class DriftOrbitDatabase implements OrbitDatabase {
   /// per-table column allowlist before being embedded into SQL, so dynamic
   /// or hostile input can never inject extra SQL syntax.
   static const Map<String, Set<String>> _tableColumns = {
+    outboxTableName: {
+      'id',
+      'workspace_id',
+      'account_id',
+      'recipient',
+      'subject',
+      'body',
+      'created_at',
+      'status',
+      'retry_count',
+      'last_error',
+      'sent_at',
+    },
     OrbitDatabaseSchema.tableWorkspaces: {
       'id',
       'name',
@@ -461,6 +475,28 @@ const String createMigrationsTable = '''
   );
 ''';
 
+/// MAIL-02B: persistent SMTP outbox (controlled sending). Additive table:
+/// created on EVERY open with IF NOT EXISTS, so existing STEP3/STEP4
+/// databases upgrade in place without a schema version bump. Status
+/// lifecycle is owned by the outbox store (queued/sending/sent/failed);
+/// in-flight leftovers after a crash are never re-sent (duplicate guard).
+const String outboxTableName = 'smtp_outbox';
+const String createSmtpOutboxTable = '''
+  CREATE TABLE IF NOT EXISTS smtp_outbox (
+    id TEXT PRIMARY KEY,
+    workspace_id TEXT NOT NULL,
+    account_id TEXT NOT NULL,
+    recipient TEXT NOT NULL,
+    subject TEXT NOT NULL,
+    body TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    status TEXT NOT NULL,
+    retry_count INTEGER NOT NULL DEFAULT 0,
+    last_error TEXT,
+    sent_at INTEGER
+  );
+''';
+
 /// Thin [GeneratedDatabase] shell that owns the connection, creates the
 /// existing ORBIT SQL schema verbatim and seeds default workspaces the same
 /// way [MemoryOrbitDatabase] does.
@@ -483,6 +519,7 @@ final class _OrbitDriftCore extends GeneratedDatabase {
     await customStatement('PRAGMA foreign_keys = ON');
     await customStatement(createSnapshotTable);
     await customStatement(createMigrationsTable);
+    await customStatement(createSmtpOutboxTable);
     await _ensureEmailsSourceTypeColumn();
   }
 
@@ -506,6 +543,7 @@ final class _OrbitDriftCore extends GeneratedDatabase {
       for (final statement in <String>[
         createSnapshotTable,
         createMigrationsTable,
+        createSmtpOutboxTable,
         OrbitDatabaseSchema.createWorkspaces,
         OrbitDatabaseSchema.createAccounts,
         OrbitDatabaseSchema.createEmails,
