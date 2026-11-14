@@ -6,6 +6,10 @@ abstract interface class MailTransport {
   Future<List<EmailRecord>> fetchEmails({
     required String folder,
     int limit = 50,
+
+    /// MAIL-02A: аккаунт для настоящего IMAP-транспорта. Симулированный
+    /// транспорт значение игнорирует.
+    String? accountId,
   });
 
   Future<bool> sendEmail(QueuedOutgoingEmail outgoing);
@@ -29,6 +33,7 @@ final class SimulatedMailTransport implements MailTransport {
   Future<List<EmailRecord>> fetchEmails({
     required String folder,
     int limit = 50,
+    String? accountId,
   }) async {
     if (!isOnline) {
       throw const FormatException('Network connection unavailable');

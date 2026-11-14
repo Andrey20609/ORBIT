@@ -8,6 +8,7 @@ import 'package:shared_preferences/shared_preferences.dart';
 
 import '../data/demo_data.dart';
 import 'database/drift_orbit_database.dart';
+import 'database/orbit_data_engine.dart';
 import 'database/orbit_database.dart';
 import 'orbit_corrupt_data.dart';
 import 'orbit_local_state_codec.dart';
@@ -88,6 +89,18 @@ final class DriftLocalStateRepository
     _db = created;
     await created.open();
     return created;
+  }
+
+  /// MAIL-02A: data engine над ТОМ ЖЕ production SQLite, которым владеет
+  /// этот репозиторий. Реальная почта (IMAP sync) пишется через этот
+  /// engine в таблицу emails как `source_type='user'` — единственный
+  /// владелец файла остаётся [DriftLocalStateRepository], отдельного
+  /// соединения не создаётся. Чтение — через
+  /// [OrbitDataEngine.getUserMailRows] (фильтр source_type='user'),
+  /// поэтому DEMO-письма в real-inbox view не попадают.
+  Future<OrbitDataEngine> mailDataEngine() async {
+    final db = await _store;
+    return OrbitDataEngine(db);
   }
 
   /// Resolves the production SQLite file location (application support

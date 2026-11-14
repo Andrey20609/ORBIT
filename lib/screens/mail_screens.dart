@@ -12,6 +12,7 @@ import '../widgets/glass_panel.dart';
 import '../widgets/orbit_environment.dart';
 import '../widgets/orbit_mail_folders_sheet.dart';
 import '../widgets/orbit_page.dart';
+import '../widgets/orbit_real_inbox_panel.dart';
 import '../widgets/orbit_snackbar.dart';
 import '../widgets/orbit_spatial_surfaces.dart';
 
@@ -429,6 +430,9 @@ final class _MailScreenState extends State<MailScreen> {
           ),
           const SizedBox(height: 12),
           if (folder == OrbitMailFolder.inbox) ...[
+            // MAIL-02A: настоящий read-only INBOX (отдельно от DEMO).
+            const OrbitRealInboxPanel(),
+            const SizedBox(height: 12),
             // Filter capsules row (Входящие / Непрочитанные / Важные)
             Wrap(
               spacing: 8,

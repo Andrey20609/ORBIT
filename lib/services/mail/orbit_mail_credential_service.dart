@@ -88,8 +88,8 @@ final class OrbitMailCredentialService {
   /// Есть ли сохранённый секрет (не возвращает само значение).
   ///
   /// Платформа без secure storage (например, тестовая среда без плагина)
-  /// сообщается как «секрета нет» — это явная, а не ложная «сохранённая»
-  ///语义状态; production Android всегда имеет плагин.
+  /// сообщается как «секрета нет» — это явное отсутствие секрета, а не
+  /// ложное «сохранённое» состояние; production Android всегда имеет плагин.
   Future<bool> hasAppPassword(String accountId) async {
     try {
       return await _store.read(secretKeyFor(accountId)) != null;

@@ -173,6 +173,32 @@ final class OrbitDataEngine extends ChangeNotifier {
     notifyListeners();
   }
 
+  /// MAIL-02A: владельцы строк реальной почты в таблице emails.
+  /// EmailRecord.toMap не пишет source_type — колонка получает DEFAULT
+  /// 'user', поэтому записи IMAP-синхронизации никогда не смешиваются
+  /// с DEMO-письмами.
+  static const String mailSourceTypeUser = 'user';
+  static const String mailSourceTypeDemo = 'demo';
+
+  /// Сырые строки реальной почты (source_type = 'user') для папки.
+  /// В отличие от [getEmails] фильтрует по source_type: DEMO-письма
+  /// в результат не попадают. Возвращает maps (включая source_type),
+  /// чтобы вызывающая сторона (MAIL-02A real-inbox view) не смогла
+  /// спутать их с демо-данными.
+  Future<List<Map<String, Object?>>> getUserMailRows({
+    String? workspaceId,
+    String folder = 'inbox',
+  }) async {
+    await ensureInitialized();
+    final ws = workspaceId ?? _activeWorkspaceId;
+    return _db.query(
+      OrbitDatabaseSchema.tableEmails,
+      where: 'workspace_id = ? AND folder = ? AND source_type = ?',
+      whereArgs: [ws, folder, mailSourceTypeUser],
+      orderBy: 'timestamp DESC',
+    );
+  }
+
   Future<void> setEmailRead(String emailId, bool isRead) async {
     await ensureInitialized();
     await _db.update(

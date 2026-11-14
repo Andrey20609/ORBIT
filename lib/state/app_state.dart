@@ -5,13 +5,16 @@ import 'package:flutter/material.dart';
 
 import '../core/module_interfaces.dart';
 import '../data/demo_data.dart';
+import '../data/drift_local_state_repository.dart';
 import '../data/orbit_corrupt_data.dart';
 import '../data/orbit_load_status.dart';
 import '../data/orbit_local_state_codec.dart';
 import '../data/orbit_local_state_repository.dart';
 import '../data/orbit_secure_store.dart';
 import '../services/brain/gemini_brain_engine.dart';
+import '../services/mail/imap_mail_transport.dart';
 import '../services/mail/mail_connection_verifier.dart';
+import '../services/mail/mail_models.dart';
 import '../services/mail/orbit_mail_credential_service.dart';
 import '../services/mail/orbit_mail_oauth_service.dart';
 import 'draft_state.dart';
@@ -635,6 +638,191 @@ final class OrbitAppState extends ChangeNotifier {
       }
     }
     return null;
+  }
+
+  // ===== MAIL-02A: настоящая read-only IMAP-синхронизация =====
+
+  ImapMailTransport? _imapTransportOverride;
+  bool _realInboxSyncing = false;
+  String? _lastRealInboxSyncError;
+  final List<UserInboxEntry> _userInboxEntries = <UserInboxEntry>[];
+
+  /// MAIL-02A: test hook — подмена IMAP-транспорта (fake socket с
+  /// protocol capture). Production использует ImapReadOnlyClient.connect
+  /// (implicit TLS 993).
+  @visibleForTesting
+  void debugImapTransportForTest(ImapMailTransport transport) {
+    _imapTransportOverride = transport;
+  }
+
+  /// Metadata реальных писем (source_type='user') для read-only view.
+  /// Отдельно от DEMO (demoEmails); без тела/HTML/вложений.
+  List<UserInboxEntry> get userInboxEntries =>
+      List<UserInboxEntry>.unmodifiable(_userInboxEntries);
+
+  bool get isRealInboxSyncing => _realInboxSyncing;
+
+  /// Sanitized сообщение последней неудачной синхронизации (без email/
+  /// паролей/токенов/сырых ответов сервера).
+  String? get lastRealInboxSyncError => _lastRealInboxSyncError;
+
+  /// Настоящая IMAP-синхронизация INBOX аккаунта (ТЗ MAIL-02A §5/§9):
+  /// - EXAMINE + BODY.PEEK + UID FETCH, максимум 20 писем; команды
+  ///   STORE/EXPUNGE/DELETE/MOVE/COPY/APPEND в транспорте отсутствуют;
+  /// - записи пишутся в production SQLite через engine над тем же файлом
+  ///   (source_type='user', детерминированный id — идемпотентно);
+  /// - credentialStatus -> verified ТОЛЬКО после фактического успеха
+  ///   (реальная аутентификация на сервере);
+  /// - отклонение аутентификации (NO от сервера / явно не настроенный
+  ///   секрет): ПЕРСИСТЕНТНО notConfigured, authMethod очищается, БЕЗ
+  ///   автоматического цикла повторов — guard notConfigured блокирует
+  ///   sync до обновления credentials пользователем (секрет не удаляется:
+  ///   форма обновления перезапишет его);
+  /// - transient-ошибка (сеть/сервер/протокол, включая transient refresh):
+  ///   ПЕРСИСТЕНТНО savedUnverified (в т.ч. понижение verified), секреты
+  ///   сохранены, retry доступен; sanitized-сообщение пользователю.
+  Future<bool> syncRealInbox(String accountId) async {
+    if (_realInboxSyncing) {
+      _lastRealInboxSyncError = 'Синхронизация уже выполняется';
+      _notify();
+      return false;
+    }
+    final index = _mailAccounts.indexWhere((a) => a.id == accountId);
+    if (index == -1) {
+      _lastRealInboxSyncError = 'Аккаунт не найден';
+      _notify();
+      return false;
+    }
+    final account = _mailAccounts[index];
+    if (account.isDemo) {
+      _lastRealInboxSyncError = 'Демо-аккаунт не синхронизируется по IMAP';
+      _notify();
+      return false;
+    }
+    if (account.credentialStatus == OrbitMailCredentialStatus.notConfigured) {
+      _lastRealInboxSyncError = 'Учётные данные не настроены';
+      _notify();
+      return false;
+    }
+    final repository = _repository;
+    if (repository is! DriftLocalStateRepository) {
+      _lastRealInboxSyncError = 'Реальная почта требует production-хранилища';
+      _notify();
+      return false;
+    }
+    _realInboxSyncing = true;
+    _lastRealInboxSyncError = null;
+    _notify();
+    try {
+      final engine = await repository.mailDataEngine();
+      final transport =
+          _imapTransportOverride ??
+          ImapMailTransport(
+            resolveAccount: (id) async {
+              final i = _mailAccounts.indexWhere((a) => a.id == id);
+              return i == -1 ? null : _mailAccounts[i];
+            },
+            resolveAccessToken: (target) =>
+                getValidOAuthAccessToken(target.id),
+            credentialService: _credentials,
+          );
+      final emails = await transport.fetchEmails(
+        folder: 'inbox',
+        accountId: accountId,
+      );
+      for (final email in emails) {
+        await engine.saveEmail(
+          email.copyWith(workspaceId: engine.activeWorkspaceId),
+        );
+      }
+      // Фактический IMAP-успех: только теперь credentialStatus = verified.
+      final idx = _mailAccounts.indexWhere((a) => a.id == accountId);
+      if (idx != -1 &&
+          _mailAccounts[idx].credentialStatus !=
+              OrbitMailCredentialStatus.verified) {
+        _mailAccounts[idx] = _mailAccounts[idx].copyWith(
+          credentialStatus: OrbitMailCredentialStatus.verified,
+        );
+        _changed();
+        await flush();
+      }
+      await refreshUserInboxEntries();
+      return true;
+    } on ImapTransportException catch (error) {
+      return _handleRealInboxFailure(accountId, error);
+    } catch (_) {
+      // Sanitized: детали (включая сырые ответы) не раскрываются.
+      // Неизвестная ошибка трактуется как transient (не как отказ
+      // аутентификации): savedUnverified, retry доступен.
+      return _handleRealInboxTransient(accountId, 'Синхронизация не выполнена');
+    } finally {
+      _realInboxSyncing = false;
+      _notify();
+    }
+  }
+
+  /// Разделение исходов по ТЗ §5/§9.9: auth rejection -> персистентно
+  /// notConfigured без цикла повторов; transient -> персистентно
+  /// savedUnverified (в т.ч. понижение verified), retry доступен.
+  Future<bool> _handleRealInboxFailure(
+    String accountId,
+    ImapTransportException error,
+  ) {
+    if (error.isAuthRelated) {
+      return _handleRealInboxAuthRejected(accountId, error.message);
+    }
+    return _handleRealInboxTransient(accountId, error.message);
+  }
+
+  Future<bool> _handleRealInboxAuthRejected(
+    String accountId,
+    String sanitizedMessage,
+  ) async {
+    final idx = _mailAccounts.indexWhere((a) => a.id == accountId);
+    if (idx != -1 &&
+        _mailAccounts[idx].credentialStatus !=
+            OrbitMailCredentialStatus.notConfigured) {
+      _mailAccounts[idx] = _mailAccounts[idx].copyWith(
+        credentialStatus: OrbitMailCredentialStatus.notConfigured,
+        clearAuthMethod: true,
+      );
+      _changed();
+      await flush();
+    }
+    _lastRealInboxSyncError = sanitizedMessage;
+    return false;
+  }
+
+  Future<bool> _handleRealInboxTransient(
+    String accountId,
+    String sanitizedMessage,
+  ) async {
+    final idx = _mailAccounts.indexWhere((a) => a.id == accountId);
+    if (idx != -1 &&
+        _mailAccounts[idx].credentialStatus ==
+            OrbitMailCredentialStatus.verified) {
+      _mailAccounts[idx] = _mailAccounts[idx].copyWith(
+        credentialStatus: OrbitMailCredentialStatus.savedUnverified,
+      );
+      _changed();
+      await flush();
+    }
+    _lastRealInboxSyncError = sanitizedMessage;
+    return false;
+  }
+
+  /// Перечитывает metadata реальных писем (source_type='user') из
+  /// production SQLite. Вызывается после синхронизации и при открытии
+  /// real-inbox view.
+  Future<void> refreshUserInboxEntries() async {
+    final repository = _repository;
+    if (repository is! DriftLocalStateRepository) return;
+    final engine = await repository.mailDataEngine();
+    final rows = await engine.getUserMailRows(folder: 'inbox');
+    _userInboxEntries
+      ..clear()
+      ..addAll(rows.map(UserInboxEntry.fromRow));
+    _notify();
   }
 
   List<BrainChatMessage> get brainChatHistory =>

@@ -25,9 +25,13 @@ final class MailService extends ChangeNotifier {
   Future<int> syncFolder({
     String folder = 'inbox',
     String? workspaceId,
+    String? accountId,
   }) async {
     final ws = workspaceId ?? _dataEngine.activeWorkspaceId;
-    final remoteEmails = await _transport.fetchEmails(folder: folder);
+    final remoteEmails = await _transport.fetchEmails(
+      folder: folder,
+      accountId: accountId,
+    );
     var saved = 0;
 
     for (final email in remoteEmails) {
