@@ -5,6 +5,7 @@ import 'package:flutter/services.dart';
 
 import '../data/demo_data.dart';
 import '../services/mail/mail_connection_verifier.dart';
+import '../services/mail/orbit_mail_oauth_service.dart';
 import '../visual_engine/orbit_palette.dart';
 import '../visual_engine/orbit_profile.dart';
 import 'glass_panel.dart';
@@ -23,6 +24,15 @@ typedef OrbitSaveMailAccountCallback =
 /// Возвращает sanitized-сообщение об ошибке либо null при успехе.
 typedef OrbitRemoveMailAccountCallback = Future<String?> Function(String id);
 
+/// MAIL-01B: OAuth Authorization Code + PKCE вход для провайдера.
+/// Возвращает sanitized-итог (без токенов/кода) и созданный аккаунт.
+typedef OrbitOAuthSignInCallback =
+    Future<OrbitMailOAuthUiOutcome> Function(
+      OrbitMailProviderType provider,
+      String accountName,
+      String accountEmail,
+    );
+
 /// Открывает модальную шторку управления почтовыми аккаунтами и диагностики соединения поверх нижнего дока.
 Future<void> showOrbitMailAccountsSheet(
   BuildContext context, {
@@ -33,6 +43,7 @@ Future<void> showOrbitMailAccountsSheet(
   OrbitSaveMailAccountCallback? onSaveAccount,
   OrbitRemoveMailAccountCallback? onRemoveAccount,
   OrbitMailConnectionVerifier? verifier,
+  OrbitOAuthSignInCallback? onOAuthSignIn,
 }) {
   HapticFeedback.mediumImpact();
   final appState = OrbitEnvironment.maybeOf(context)?.appState;
@@ -85,6 +96,23 @@ Future<void> showOrbitMailAccountsSheet(
             }
           }),
       verifier: verifier ?? OrbitMailConnectionVerifier(),
+      onOAuthSignIn: onOAuthSignIn ??
+          ((provider, accountName, accountEmail) async {
+            if (appState == null) {
+              return const OrbitMailOAuthUiOutcome.error(
+                'Локальное состояние недоступно',
+              );
+            }
+            try {
+              return await appState.signInMailAccountWithOAuth(
+                providerType: provider,
+                accountName: accountName,
+                accountEmail: accountEmail,
+              );
+            } catch (error) {
+              return OrbitMailOAuthUiOutcome.error(error.toString());
+            }
+          }),
     ),
   );
 }
@@ -98,6 +126,7 @@ final class OrbitMailAccountsSheet extends StatefulWidget {
     required this.onSaveAccount,
     required this.onRemoveAccount,
     required this.verifier,
+    required this.onOAuthSignIn,
     super.key,
   });
 
@@ -108,6 +137,7 @@ final class OrbitMailAccountsSheet extends StatefulWidget {
   final OrbitSaveMailAccountCallback onSaveAccount;
   final OrbitRemoveMailAccountCallback onRemoveAccount;
   final OrbitMailConnectionVerifier verifier;
+  final OrbitOAuthSignInCallback onOAuthSignIn;
 
   @override
   State<OrbitMailAccountsSheet> createState() => _OrbitMailAccountsSheetState();
@@ -133,6 +163,9 @@ final class _OrbitMailAccountsSheetState extends State<OrbitMailAccountsSheet> {
   bool _isSaving = false;
   String? _saveError;
   bool _passwordObscured = true;
+
+  // MAIL-01B: OAuth pending (browser flow) блокирует повторный запуск.
+  bool _isOAuthPending = false;
 
   /// MAIL-01A: OAuth (Gmail/Outlook) не имитируется — на этом этапе
   /// app password для них не собирается вовсе.
@@ -209,6 +242,45 @@ final class _OrbitMailAccountsSheetState extends State<OrbitMailAccountsSheet> {
       _currentStage = result.isSuccess
           ? MailVerificationStage.success
           : result.failedStage;
+    });
+  }
+
+  /// MAIL-01B: OAuth вход для Gmail/Outlook через системный browser
+  /// (AppAuth, PKCE). Pending блокирует повторный запуск; отмена — тихо;
+  /// CONFIG_REQUIRED и invalid_grant — sanitized-сообщения; успех —
+  /// аккаунт с «Сохранено, не проверено» (никогда не «Аутентифицировано»).
+  Future<void> _startOAuthSignIn() async {
+    if (_isOAuthPending || _isSaving || _isVerifying) return;
+    setState(() {
+      _isOAuthPending = true;
+      _saveError = null;
+    });
+    final outcome = await widget.onOAuthSignIn(
+      _selectedProvider,
+      _nameController.text.trim(),
+      _emailController.text.trim(),
+    );
+    if (!mounted) return;
+    if (outcome.status == OrbitMailOAuthUiStatus.cancelled) {
+      setState(() => _isOAuthPending = false);
+      return;
+    }
+    if (outcome.status == OrbitMailOAuthUiStatus.success) {
+      final account = outcome.account!;
+      setState(() {
+        _isOAuthPending = false;
+        _accounts = [
+          for (final a in _accounts) a.copyWith(isActive: false),
+          account,
+        ];
+        _isAddingAccount = false;
+        _passwordController.clear();
+      });
+      return;
+    }
+    setState(() {
+      _isOAuthPending = false;
+      _saveError = outcome.message ?? 'Вход не выполнен';
     });
   }
 
@@ -957,39 +1029,35 @@ final class _OrbitMailAccountsSheetState extends State<OrbitMailAccountsSheet> {
             ),
           ),
         ] else ...[
-          Container(
-            key: const Key('mail-oauth-disabled-note'),
-            padding: const EdgeInsets.all(12),
-            decoration: BoxDecoration(
-              color: palette.surface.withValues(alpha: 0.4),
-              borderRadius: BorderRadius.circular(10),
-              border: Border.all(
-                color: palette.textPrimary.withValues(alpha: 0.14),
-              ),
+          // MAIL-01B: настоящий OAuth Authorization Code + PKCE через
+          // системный browser (Custom Tabs). Без config — честный
+          // CONFIG_REQUIRED до открытия browser.
+          OrbitFilledButton(
+            buttonKey: const Key('mail-oauth-signin-btn'),
+            palette: palette,
+            radius: _radius * 0.7,
+            isPrimary: true,
+            icon: _isOAuthPending
+                ? Icons.hourglass_top_rounded
+                : Icons.login_rounded,
+            label: _isOAuthPending
+                ? 'Вход через браузер...'
+                : (_selectedProvider == OrbitMailProviderType.gmail
+                    ? 'Войти через Google'
+                    : 'Войти через Microsoft'),
+            onTap: _isOAuthPending ? () {} : () => _startOAuthSignIn(),
+          ),
+          const SizedBox(height: 8),
+          Text(
+            'Вход через системный браузер (OAuth). Для работы требуется '
+            'регистрация приложения ORBIT у провайдера — это не пароль и '
+            'не client secret от пользователя.',
+            style: TextStyle(
+              fontSize: 10.5,
+              height: 1.3,
+              color: palette.textSecondary.withValues(alpha: 0.85),
             ),
-            child: Row(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Icon(
-                  Icons.lock_outline_rounded,
-                  size: 16,
-                  color: palette.textSecondary,
-                ),
-                const SizedBox(width: 8),
-                Expanded(
-                  child: Text(
-                    'Для ${_selectedProvider.label} вход по OAuth будет '
-                    'добавлен отдельным этапом. Вход по паролю приложения '
-                    'для этого провайдера сейчас недоступен.',
-                    style: TextStyle(
-                      fontSize: 12,
-                      height: 1.35,
-                      color: palette.textSecondary,
-                    ),
-                  ),
-                ),
-              ],
-            ),
+            textAlign: TextAlign.center,
           ),
         ],
         if (_saveError != null) ...[
@@ -1159,7 +1227,7 @@ final class _OrbitMailAccountsSheetState extends State<OrbitMailAccountsSheet> {
                   ? 'Сохранение...'
                   : (_providerSupportsAppPassword
                       ? 'Сохранить аккаунт и пароль'
-                      : 'Сохранение недоступно (OAuth — отдельный этап)'),
+                      : 'Сохраните аккаунт кнопкой входа выше'),
               // MAIL-01A: pending state блокирует double submit; для
               // OAuth-провайдеров сохранение недоступно на этом этапе.
               onTap:

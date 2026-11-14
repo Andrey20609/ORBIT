@@ -13,26 +13,43 @@ import '../data/orbit_secure_store.dart';
 import '../services/brain/gemini_brain_engine.dart';
 import '../services/mail/mail_connection_verifier.dart';
 import '../services/mail/orbit_mail_credential_service.dart';
+import '../services/mail/orbit_mail_oauth_service.dart';
 import 'draft_state.dart';
 
 final class OrbitAppState extends ChangeNotifier {
-  OrbitAppState([OrbitLocalStateRepository? repository, OrbitSecretStore? secretStore])
-    : _repository = repository ?? MemoryLocalStateRepository(),
-      // MAIL-01A: production по умолчанию использует secure storage
-      // (FlutterOrbitSecretStore); тесты подставляют MemoryOrbitSecretStore.
-      _credentials = OrbitMailCredentialService(
-        store: secretStore ?? const FlutterOrbitSecretStore(),
-      ) {
+  OrbitAppState([
+    OrbitLocalStateRepository? repository,
+    OrbitSecretStore? secretStore,
+    OrbitOAuthClient? oauthClient,
+    OrbitMailOAuthConfigOverride? oauthConfigOverride,
+  ]) : _repository = repository ?? MemoryLocalStateRepository(),
+       // MAIL-01A: production по умолчанию использует secure storage
+       // (FlutterOrbitSecretStore); тесты подставляют MemoryOrbitSecretStore.
+       _credentials = OrbitMailCredentialService(
+         store: secretStore ?? const FlutterOrbitSecretStore(),
+       ),
+       // MAIL-01B: production использует AppAuth (системный browser);
+       // тесты подставляют mock double.
+       _oauthClient = oauthClient ?? const AppAuthOAuthClient(),
+       _oauthConfigOverride = oauthConfigOverride {
     unawaited(load());
   }
 
   final OrbitLocalStateRepository _repository;
   final OrbitMailCredentialService _credentials;
+  final OrbitOAuthClient _oauthClient;
+  final OrbitMailOAuthConfigOverride? _oauthConfigOverride;
+  bool _oauthFlowInProgress = false;
 
   /// MAIL-01A: credential-сервис доступен только чтению состояния — сам
   /// секрет наружу (UI/модель/снапшот) не отдаётся.
   @visibleForTesting
   OrbitMailCredentialService get mailCredentialService => _credentials;
+
+  /// MAIL-01B: идёт ли сейчас OAuth-браузер flow (защита от двойного
+  /// запуска).
+  @visibleForTesting
+  bool get isMailOAuthFlowInProgress => _oauthFlowInProgress;
 
   /// MAIL-01A: test hook — подсчитывающая обёртка верификатора для проверки
   /// «credential-операции не выполняют сетевых проверок».
@@ -193,6 +210,7 @@ final class OrbitAppState extends ChangeNotifier {
   Future<void> saveMailAccountWithCredentials(
     OrbitMailAccount account, {
     String? appPassword,
+    OrbitOAuthTokenSet? oauthTokens,
   }) async {
     if (account.id.trim().isEmpty) {
       throw const OrbitMailCredentialException(
@@ -203,39 +221,60 @@ final class OrbitAppState extends ChangeNotifier {
     final isNew = index == -1;
     final previous = isNew ? null : _mailAccounts[index];
     final trimmedPassword = (appPassword ?? '').trim();
-    final replacingSecret = trimmedPassword.isNotEmpty;
+    final replacingPassword = trimmedPassword.isNotEmpty;
+    final savingOAuth = oauthTokens != null;
+    final replacingSecret = replacingPassword || savingOAuth;
 
     if (isNew && !replacingSecret) {
       throw const OrbitMailCredentialException(
-        'Для нового аккаунта нужен пароль приложения',
+        'Для нового аккаунта нужен пароль приложения или OAuth-вход',
+      );
+    }
+    if (replacingPassword && savingOAuth) {
+      throw const OrbitMailCredentialException(
+        'Нельзя сохранять одновременно пароль приложения и OAuth-токены',
       );
     }
 
     // Локальный (только в методе) backup прежнего секрета для отката замены.
-    String? previousSecret;
-    if (replacingSecret && !isNew) {
-      previousSecret = await _credentials.readAppPasswordForTransport(
-        account.id,
-      );
+    String? previousAppPassword;
+    OrbitOAuthTokenSet? previousOAuthTokens;
+    if (!isNew) {
+      if (replacingPassword) {
+        previousAppPassword = await _credentials.readAppPasswordForTransport(
+          account.id,
+        );
+      }
+      if (savingOAuth) {
+        previousOAuthTokens = await _credentials.readOAuthTokens(account.id);
+      }
     }
 
-    // 1. Секрет — только при явной замене.
-    if (replacingSecret) {
+    // 1. Секрет — только при явной записи нового.
+    if (replacingPassword) {
       await _credentials.saveAppPassword(
         accountId: account.id,
         appPassword: trimmedPassword,
+      );
+    }
+    if (savingOAuth) {
+      await _credentials.saveOAuthTokens(
+        accountId: account.id,
+        tokens: oauthTokens,
       );
     }
 
     // 2. Metadata с не-secret credential-статусом.
     final hasSecret =
         replacingSecret ||
-        (!isNew && await _credentials.hasAppPassword(account.id));
+        (!isNew && await _credentials.hasAccountSecret(account.id));
     final effective = account.copyWith(
       credentialStatus: hasSecret
           ? OrbitMailCredentialStatus.savedUnverified
           : OrbitMailCredentialStatus.notConfigured,
-      authMethod: hasSecret ? 'appPassword' : null,
+      authMethod: hasSecret
+          ? (savingOAuth ? 'oauth' : 'appPassword')
+          : null,
     );
     if (isNew) {
       if (effective.isActive) {
@@ -252,7 +291,7 @@ final class OrbitAppState extends ChangeNotifier {
       await flush();
     } catch (_) {
       // 3. Компенсация: metadata не записались — откатываем память и
-      // возвращаем secure storage в прежнее состояние.
+      // возвращаем secure storage в прежнее состояние (по типу секрета).
       if (isNew) {
         _mailAccounts.removeWhere((a) => a.id == effective.id);
       } else if (previous != null) {
@@ -261,18 +300,29 @@ final class OrbitAppState extends ChangeNotifier {
       _notify();
       if (replacingSecret) {
         try {
-          if (previousSecret != null) {
-            await _credentials.saveAppPassword(
-              accountId: account.id,
-              appPassword: previousSecret,
-            );
+          if (replacingPassword) {
+            if (previousAppPassword != null) {
+              await _credentials.saveAppPassword(
+                accountId: account.id,
+                appPassword: previousAppPassword,
+              );
+            } else {
+              await _credentials.deleteAppPassword(account.id);
+            }
           } else {
-            await _credentials.deleteAppPassword(account.id);
+            if (previousOAuthTokens != null) {
+              await _credentials.saveOAuthTokens(
+                accountId: account.id,
+                tokens: previousOAuthTokens,
+              );
+            } else {
+              await _credentials.deleteOAuthTokens(account.id);
+            }
           }
         } on OrbitMailCredentialException {
           throw const OrbitMailCredentialException(
             'Не удалось сохранить аккаунт; дополнительно не удалось '
-            'восстановить прежнее состояние пароля — повторите попытку',
+            'восстановить прежнее состояние секрета — повторите попытку',
           );
         }
       }
@@ -356,6 +406,232 @@ final class OrbitAppState extends ChangeNotifier {
         'уже удалён; аккаунт помечен как «Пароль не настроен»',
       );
     }
+  }
+
+  // ===== MAIL-01B: OAuth Authorization Code + PKCE (Gmail/Outlook) =====
+
+  /// Конфигурация провайдера для OAuth (issuer/clientId/scopes) либо
+  /// [OrbitOAuthConfigRequiredException] ДО открытия browser.
+  ({String issuer, String clientId, List<String> scopes, String redirectUri})
+      _oauthConfigFor(OrbitMailProviderType providerType) {
+    final override = _oauthConfigOverride;
+    final googleClientId = override?.googleClientId ??
+        (OrbitMailOAuthConfig.hasGoogleClientId
+            ? OrbitMailOAuthConfig.googleClientId
+            : '');
+    final outlookClientId = override?.outlookClientId ??
+        (OrbitMailOAuthConfig.hasOutlookClientId
+            ? OrbitMailOAuthConfig.outlookClientId
+            : '');
+    final outlookTenant =
+        override?.outlookTenant ?? OrbitMailOAuthConfig.outlookTenant;
+    final redirectUri =
+        override?.redirectUri ?? OrbitMailOAuthConfig.redirectUri;
+    switch (providerType) {
+      case OrbitMailProviderType.gmail:
+        if (googleClientId.isEmpty) {
+          throw const OrbitOAuthConfigRequiredException(
+            'CONFIG_REQUIRED: для входа через Google приложение должно быть '
+            'зарегистрировано (client ID) и передано через ORBIT_GOOGLE_CLIENT_ID',
+          );
+        }
+        return (
+          issuer: OrbitOAuthProvider.google.issuer,
+          clientId: googleClientId,
+          scopes: OrbitOAuthProvider.google.scopes,
+          redirectUri: redirectUri,
+        );
+      case OrbitMailProviderType.outlook:
+        if (outlookClientId.isEmpty) {
+          throw const OrbitOAuthConfigRequiredException(
+            'CONFIG_REQUIRED: для входа через Microsoft приложение должно '
+            'быть зарегистрировано (client ID) и передано через '
+            'ORBIT_OUTLOOK_CLIENT_ID',
+          );
+        }
+        return (
+          issuer: OrbitOAuthProvider.outlook.issuerFor(outlookTenant),
+          clientId: outlookClientId,
+          scopes: OrbitOAuthProvider.outlook.scopes,
+          redirectUri: redirectUri,
+        );
+      default:
+        throw const OrbitOAuthConfigRequiredException(
+          'OAuth для этого провайдера не поддерживается',
+        );
+    }
+  }
+
+  /// MAIL-01B: OAuth Authorization Code + PKCE вход для Gmail/Outlook.
+  ///
+  /// - отсутствие config → [OrbitMailOAuthUiStatus.configRequired] ДО
+  ///   открытия browser (никакой имитации live OAuth);
+  /// - системный browser/Custom Tabs через AppAuth (PKCE/state/nonce
+  ///   генерирует AppAuth); двойной запуск заблокирован pending-флагом;
+  /// - user cancellation → прежнее состояние, без ошибки и токенов;
+  /// - токены — только secure storage; metadata — только `savedUnverified`
+  ///   (настоящая аутентификация IMAP появится в MAIL-02);
+  /// - authorization code / tokens не попадают в логи/снапшот.
+  Future<OrbitMailOAuthUiOutcome> signInMailAccountWithOAuth({
+    required OrbitMailProviderType providerType,
+    required String accountName,
+    required String accountEmail,
+  }) async {
+    if (_oauthFlowInProgress) {
+      return const OrbitMailOAuthUiOutcome.error(
+        'OAuth-вход уже выполняется — подождите завершения',
+      );
+    }
+    final name = accountName.trim().isEmpty
+        ? providerType.label
+        : accountName.trim();
+    final email = accountEmail.trim();
+
+    ({String issuer, String clientId, List<String> scopes, String redirectUri})
+        config;
+    try {
+      config = _oauthConfigFor(providerType);
+    } on OrbitOAuthConfigRequiredException catch (error) {
+      return OrbitMailOAuthUiOutcome.configRequired(error.toString());
+    }
+
+    _oauthFlowInProgress = true;
+    _notify();
+    final OrbitOAuthTokenSet tokens;
+    try {
+      tokens = await _oauthClient.authorize(
+        issuer: config.issuer,
+        clientId: config.clientId,
+        scopes: config.scopes,
+        redirectUri: config.redirectUri,
+      );
+    } on OrbitOAuthUserCancelledException {
+      _oauthFlowInProgress = false;
+      _notify();
+      // Отмена: прежнее состояние, без ошибки и токенов.
+      return const OrbitMailOAuthUiOutcome.cancelled();
+    } on OrbitOAuthConfigRequiredException catch (error) {
+      _oauthFlowInProgress = false;
+      _notify();
+      return OrbitMailOAuthUiOutcome.configRequired(error.toString());
+    } on OrbitOAuthInvalidGrantException {
+      _oauthFlowInProgress = false;
+      _notify();
+      return const OrbitMailOAuthUiOutcome.invalidGrant(
+        'Сервер отклонил вход (invalid_grant) — повторите вход',
+      );
+    } on OrbitOAuthTransientException catch (error) {
+      _oauthFlowInProgress = false;
+      _notify();
+      return OrbitMailOAuthUiOutcome.error(
+        'Временная ошибка входа: ${error.runtimeType.toString().isEmpty ? "повторите попытку" : "повторите попытку"}',
+      );
+    } catch (_) {
+      _oauthFlowInProgress = false;
+      _notify();
+      return const OrbitMailOAuthUiOutcome.error('Вход не выполнен');
+    }
+    _oauthFlowInProgress = false;
+
+    final account = OrbitMailAccount(
+      id: 'acc_${DateTime.now().microsecondsSinceEpoch}',
+      name: name,
+      email: email.isEmpty ? 'oauth@${providerType.name}' : email,
+      providerType: providerType,
+      isActive: true,
+    );
+    try {
+      await saveMailAccountWithCredentials(account, oauthTokens: tokens);
+    } on OrbitMailCredentialException catch (error) {
+      return OrbitMailOAuthUiOutcome.error(error.toString());
+    } catch (_) {
+      return const OrbitMailOAuthUiOutcome.error(
+        'Не удалось сохранить аккаунт',
+      );
+    }
+    return OrbitMailOAuthUiOutcome.success(account);
+  }
+
+  /// MAIL-01B: действующий access token аккаунта (для будущего mail
+  /// транспорта); refresh/rotation/invalid_grant по ТЗ §7. Metadata
+  /// обновляется согласно исходу refresh.
+  Future<String?> getValidOAuthAccessToken(String accountId) async {
+    final index = _mailAccounts.indexWhere((a) => a.id == accountId);
+    if (index == -1) return null;
+    final account = _mailAccounts[index];
+
+    String? accessToken;
+    try {
+      accessToken = await _credentials.getValidAccessToken(
+        accountId,
+        refreshCallback: (refreshToken) async {
+          final config = _oauthConfigFor(account.providerType);
+          try {
+            final tokens = await _oauthClient.refresh(
+              issuer: config.issuer,
+              clientId: config.clientId,
+              scopes: config.scopes,
+              redirectUri: config.redirectUri,
+              refreshToken: refreshToken,
+            );
+            return OrbitAccessTokenRefreshed(tokens);
+          } on OrbitOAuthInvalidGrantException {
+            return const OrbitAccessTokenRefreshInvalidGrant();
+          } on OrbitOAuthConfigRequiredException {
+            // Конфигурация отсутствует: токены сохранены, retry после
+            // настройки — не invalid_grant.
+            return const OrbitAccessTokenRefreshTransient();
+          } on OrbitOAuthUserCancelledException {
+            return const OrbitAccessTokenRefreshTransient();
+          } on OrbitOAuthTransientException {
+            return const OrbitAccessTokenRefreshTransient();
+          } catch (_) {
+            return const OrbitAccessTokenRefreshTransient();
+          }
+        },
+      );
+    } on OrbitMailCredentialException {
+      // secure storage недоступен: без ложных статусов.
+      return null;
+    }
+
+    final idx = _mailAccounts.indexWhere((a) => a.id == accountId);
+    if (idx == -1) return accessToken;
+    if (accessToken != null) {
+      // Успешный refresh/valid: статус остаётся savedUnverified (настоящая
+      // аутентификация IMAP — MAIL-02).
+      if (_mailAccounts[idx].credentialStatus !=
+          OrbitMailCredentialStatus.savedUnverified) {
+        _mailAccounts[idx] = _mailAccounts[idx].copyWith(
+          credentialStatus: OrbitMailCredentialStatus.savedUnverified,
+          authMethod: 'oauth',
+        );
+        _changed();
+      }
+      return accessToken;
+    }
+    // null: либо transient (токены сохранены), либо invalid_grant
+    // (токены удалены сервисом). Сверяем факт наличия и синхронизируем
+    // metadata.
+    final bool hasTokens;
+    try {
+      hasTokens = await _credentials.hasOAuthTokens(accountId);
+    } on OrbitMailCredentialException {
+      return null;
+    }
+    if (!hasTokens) {
+      // invalid_grant / пустой набор: notConfigured + без authMethod.
+      if (_mailAccounts[idx].credentialStatus !=
+          OrbitMailCredentialStatus.notConfigured) {
+        _mailAccounts[idx] = _mailAccounts[idx].copyWith(
+          credentialStatus: OrbitMailCredentialStatus.notConfigured,
+          clearAuthMethod: true,
+        );
+        _changed();
+        await flush();
+      }
+    }
+    return null;
   }
 
   List<BrainChatMessage> get brainChatHistory =>
@@ -660,7 +936,7 @@ final class OrbitAppState extends ChangeNotifier {
         }
         final bool hasSecret;
         try {
-          hasSecret = await _credentials.hasAppPassword(account.id);
+          hasSecret = await _credentials.hasAccountSecret(account.id);
         } on OrbitMailCredentialException {
           continue;
         }

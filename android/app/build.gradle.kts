@@ -62,6 +62,12 @@ android {
         buildConfigField("String", "ORBIT_BUILD_FLAVOR", "\"premium-reliability\"")
         // Some x86_64 emulator release drivers report zero Impeller texture limits.
         manifestPlaceholders["enableImpeller"] = if (targetAbi == "x86_64") "false" else "true"
+        // MAIL-01B: AppAuth redirect scheme for the system browser (Custom
+        // Tabs) callback. Index assignment ADDS to the Flutter-populated
+        // placeholder map (Groovy `=` would wipe it, breaking
+        // ${applicationName}). Lowercase, must match the OAuth redirect
+        // URI exactly: app.orbit.orbit_visual_lab:/oauthredirect
+        manifestPlaceholders["appAuthRedirectScheme"] = "app.orbit.orbit_visual_lab"
         ndk {
             if (targetAbi != null) abiFilters += targetAbi
         }
