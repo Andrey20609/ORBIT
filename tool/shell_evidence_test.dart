@@ -6,9 +6,9 @@
 // through the production decode path and saves the captured frame to the
 // explicitly configured output path (directories are created as needed).
 import 'dart:io';
+import 'dart:typed_data';
 import 'dart:ui' as ui;
 
-import 'package:flutter/material.dart';
 import 'package:flutter/rendering.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:orbit_visual_lab/orbit_bootstrap.dart';
@@ -67,6 +67,8 @@ void main() {
 
   testWidgets('capture the startup shell first frame with the actual '
       'artwork (pixel-asserted, explicit output path)', (tester) async {
+    // Deliberate production-path use from the review-evidence tool.
+    // ignore: invalid_use_of_visible_for_testing_member
     final artwork = await tester.runAsync(() => decodeBrandingArtworkAsset());
     expect(artwork, isNotNull);
     await tester.pumpWidget(OrbitStartupShell(artwork: artwork));
