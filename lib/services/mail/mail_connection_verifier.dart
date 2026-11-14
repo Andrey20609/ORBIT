@@ -50,10 +50,15 @@ enum OrbitMailProviderType {
 }
 
 /// Статус верификации сохраненного почтового аккаунта.
+///
+/// MAIL-01A: это статус ENDPOINT-доступности (DNS/TCP/TLS/banner), а не
+/// статус аутентификации. `verified` после диагностики означает только
+/// «Сервер доступен»; credential-статус живёт отдельно в
+/// [OrbitMailCredentialStatus].
 enum OrbitMailAccountStatus {
-  verified('Проверен'),
-  failed('Ошибка'),
-  unverified('Не проверен');
+  verified('Сервер доступен'),
+  failed('Сервер недоступен'),
+  unverified('Сервер не проверялся');
 
   const OrbitMailAccountStatus(this.label);
   final String label;
@@ -63,6 +68,28 @@ enum OrbitMailAccountStatus {
       if (s.name == raw) return s;
     }
     return OrbitMailAccountStatus.unverified;
+  }
+}
+
+/// MAIL-01A: статус учётных данных аккаунта — отдельное не-secret поле.
+///
+/// `savedUnverified` означает: пароль приложения сохранён в secure storage
+/// и metadata успешно записаны, но НАСТОЯЩАЯ аутентификация на сервере ещё
+/// не выполнялась (она появится в MAIL-02). `verified` в этом этапе
+/// не присваивается никем.
+enum OrbitMailCredentialStatus {
+  notConfigured('Пароль не настроен'),
+  savedUnverified('Сохранено, не проверено'),
+  verified('Аутентифицировано');
+
+  const OrbitMailCredentialStatus(this.label);
+  final String label;
+
+  static OrbitMailCredentialStatus fromName(String? raw) {
+    for (final s in OrbitMailCredentialStatus.values) {
+      if (s.name == raw) return s;
+    }
+    return OrbitMailCredentialStatus.notConfigured;
   }
 }
 
@@ -85,6 +112,8 @@ final class OrbitMailAccount {
     this.lastLatencyMs,
     this.isActive = false,
     this.status = OrbitMailAccountStatus.unverified,
+    this.credentialStatus = OrbitMailCredentialStatus.notConfigured,
+    this.authMethod,
     this.isDemo = false,
     this.lastError,
   }) : providerType = providerType ??
@@ -108,10 +137,20 @@ final class OrbitMailAccount {
   final String outgoingHost;
   final int outgoingPort;
   final bool useOutgoingSsl;
+  /// MAIL-01A: время последней ENDPOINT-проверки (DNS/TCP/TLS/banner).
+  /// Это НЕ время аутентификации — credential-статус живёт отдельно.
   final String? lastVerifiedAtIso;
   final int? lastLatencyMs;
   final bool isActive;
   final OrbitMailAccountStatus status;
+
+  /// MAIL-01A: credential-статус (не-secret metadata). Пароль приложения
+  /// никогда не хранится в этой модели — только в secure storage через
+  /// OrbitMailCredentialService.
+  final OrbitMailCredentialStatus credentialStatus;
+
+  /// Не-secret metadata способа аутентификации (например `appPassword`).
+  final String? authMethod;
   final bool isDemo;
   final String? lastError;
 
@@ -137,6 +176,8 @@ final class OrbitMailAccount {
     int? lastLatencyMs,
     bool? isActive,
     OrbitMailAccountStatus? status,
+    OrbitMailCredentialStatus? credentialStatus,
+    String? authMethod,
     bool? isDemo,
     String? lastError,
   }) {
@@ -161,6 +202,8 @@ final class OrbitMailAccount {
       lastLatencyMs: lastLatencyMs ?? this.lastLatencyMs,
       isActive: isActive ?? this.isActive,
       status: status ?? this.status,
+      credentialStatus: credentialStatus ?? this.credentialStatus,
+      authMethod: authMethod ?? this.authMethod,
       isDemo: isDemo ?? this.isDemo,
       lastError: lastError ?? this.lastError,
     );
@@ -181,6 +224,8 @@ final class OrbitMailAccount {
         'lastLatencyMs': lastLatencyMs,
         'isActive': isActive,
         'status': status.name,
+        'credentialStatus': credentialStatus.name,
+        if (authMethod != null) 'authMethod': authMethod,
         'isDemo': isDemo,
         if (lastError != null) 'lastError': lastError,
       };
@@ -207,6 +252,12 @@ final class OrbitMailAccount {
       lastLatencyMs: json['lastLatencyMs'] as int?,
       isActive: (json['isActive'] as bool?) ?? false,
       status: OrbitMailAccountStatus.fromName(json['status'] as String?),
+      // MAIL-01A: старые JSON без новых полей загружаются как notConfigured
+      // (секрет в secure storage отсутствует для legacy-аккаунтов).
+      credentialStatus: OrbitMailCredentialStatus.fromName(
+        json['credentialStatus'] as String?,
+      ),
+      authMethod: json['authMethod'] as String?,
       isDemo: (json['isDemo'] as bool?) ?? false,
       lastError: json['lastError'] as String?,
     );
@@ -266,7 +317,10 @@ final class MailVerificationCancelToken {
 }
 
 /// Сервис 4-этапной верификации подключения к почтовым серверам (DNS -> TCP -> TLS -> Banner).
-final class OrbitMailConnectionVerifier {
+///
+/// Не-final: тесты подставляют подсчитывающую обёртку для проверки того,
+/// что credential-операции не выполняют сетевых проверок.
+class OrbitMailConnectionVerifier {
   OrbitMailConnectionVerifier({
     bool? isMockMode,
     this.timeout = const Duration(seconds: 5),

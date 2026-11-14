@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:ui';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
@@ -11,6 +12,17 @@ import 'orbit_environment.dart';
 import 'orbit_pressable.dart';
 import 'orbit_spatial_surfaces.dart';
 
+/// Сохранение аккаунта с app password через secure-путь состояния.
+/// Возвращает sanitized-сообщение об ошибке либо null при успехе.
+/// Пароль НИКОГДА не сохраняется в callback'е — он уходит в
+/// OrbitMailCredentialService (secure storage) через OrbitAppState.
+typedef OrbitSaveMailAccountCallback =
+    Future<String?> Function(OrbitMailAccount account, String? appPassword);
+
+/// Безопасное удаление аккаунта (секрет → metadata, с компенсацией).
+/// Возвращает sanitized-сообщение об ошибке либо null при успехе.
+typedef OrbitRemoveMailAccountCallback = Future<String?> Function(String id);
+
 /// Открывает модальную шторку управления почтовыми аккаунтами и диагностики соединения поверх нижнего дока.
 Future<void> showOrbitMailAccountsSheet(
   BuildContext context, {
@@ -18,8 +30,8 @@ Future<void> showOrbitMailAccountsSheet(
   OrbitProfile? profile,
   List<OrbitMailAccount>? accounts,
   ValueChanged<String>? onSelectActiveAccount,
-  ValueChanged<OrbitMailAccount>? onSaveAccount,
-  ValueChanged<String>? onRemoveAccount,
+  OrbitSaveMailAccountCallback? onSaveAccount,
+  OrbitRemoveMailAccountCallback? onRemoveAccount,
   OrbitMailConnectionVerifier? verifier,
 }) {
   HapticFeedback.mediumImpact();
@@ -45,9 +57,33 @@ Future<void> showOrbitMailAccountsSheet(
       onSelectActiveAccount: onSelectActiveAccount ??
           ((id) => appState?.setActiveMailAccount(id)),
       onSaveAccount: onSaveAccount ??
-          ((acc) => appState?.addMailAccount(acc)),
+          ((acc, appPassword) async {
+            if (appState == null) {
+              return 'Локальное состояние недоступно';
+            }
+            try {
+              await appState.saveMailAccountWithCredentials(
+                acc,
+                appPassword: appPassword,
+              );
+              return null;
+            } catch (error) {
+              // Sanitized: секрет в сообщениях исключений не участвует.
+              return error.toString();
+            }
+          }),
       onRemoveAccount: onRemoveAccount ??
-          ((id) => appState?.removeMailAccount(id)),
+          ((id) async {
+            if (appState == null) {
+              return 'Локальное состояние недоступно';
+            }
+            try {
+              await appState.removeMailAccountSecurely(id);
+              return null;
+            } catch (error) {
+              return error.toString();
+            }
+          }),
       verifier: verifier ?? OrbitMailConnectionVerifier(),
     ),
   );
@@ -69,8 +105,8 @@ final class OrbitMailAccountsSheet extends StatefulWidget {
   final OrbitProfile profile;
   final List<OrbitMailAccount> initialAccounts;
   final ValueChanged<String> onSelectActiveAccount;
-  final ValueChanged<OrbitMailAccount> onSaveAccount;
-  final ValueChanged<String> onRemoveAccount;
+  final OrbitSaveMailAccountCallback onSaveAccount;
+  final OrbitRemoveMailAccountCallback onRemoveAccount;
   final OrbitMailConnectionVerifier verifier;
 
   @override
@@ -86,11 +122,24 @@ final class _OrbitMailAccountsSheetState extends State<OrbitMailAccountsSheet> {
   late final TextEditingController _emailController;
   late final TextEditingController _hostController;
   late final TextEditingController _portController;
+  late final TextEditingController _passwordController;
   bool _useSsl = true;
 
   MailVerificationStage _currentStage = MailVerificationStage.idle;
   MailDiagnosticResult? _lastDiagnostic;
   bool _isVerifying = false;
+
+  // MAIL-01A: save через secure-путь; pending блокирует double submit.
+  bool _isSaving = false;
+  String? _saveError;
+  bool _passwordObscured = true;
+
+  /// MAIL-01A: OAuth (Gmail/Outlook) не имитируется — на этом этапе
+  /// app password для них не собирается вовсе.
+  bool get _providerSupportsAppPassword =>
+      _selectedProvider == OrbitMailProviderType.yandex ||
+      _selectedProvider == OrbitMailProviderType.mailRu ||
+      _selectedProvider == OrbitMailProviderType.custom;
 
   double get _radius => orbitRadiusForProfile(widget.profile);
 
@@ -106,6 +155,7 @@ final class _OrbitMailAccountsSheetState extends State<OrbitMailAccountsSheet> {
     _portController = TextEditingController(
       text: '${_selectedProvider.defaultIncomingPort}',
     );
+    _passwordController = TextEditingController();
   }
 
   @override
@@ -114,6 +164,8 @@ final class _OrbitMailAccountsSheetState extends State<OrbitMailAccountsSheet> {
     _emailController.dispose();
     _hostController.dispose();
     _portController.dispose();
+    // MAIL-01A: контроллер пароля очищается и dispose'ится после save/close.
+    _passwordController.dispose();
     super.dispose();
   }
 
@@ -126,6 +178,7 @@ final class _OrbitMailAccountsSheetState extends State<OrbitMailAccountsSheet> {
           provider.defaultIncomingPort == 465;
       _currentStage = MailVerificationStage.idle;
       _lastDiagnostic = null;
+      _saveError = null;
     });
   }
 
@@ -159,11 +212,25 @@ final class _OrbitMailAccountsSheetState extends State<OrbitMailAccountsSheet> {
     });
   }
 
-  Future<void> _saveVerifiedAccount() async {
-    if (_lastDiagnostic == null) {
-      await _runLiveVerification();
+  /// MAIL-01A: сохранение через secure-путь состояния. Endpoint check —
+  /// ОТДЕЛЬНОЕ необязательное действие: он не требует пароля и не меняет
+  /// credential-статус. Пароль приложения уходит только в secure storage
+  /// (сервис состояния), в модель/JSON он не попадает.
+  Future<void> _saveAccount() async {
+    if (_isSaving || _isVerifying) return;
+    if (!_providerSupportsAppPassword) return;
+    final password = _passwordController.text.trim();
+    if (password.isEmpty) {
+      setState(() {
+        _saveError = 'Введите пароль приложения';
+      });
+      return;
     }
-    if (!mounted) return;
+
+    setState(() {
+      _isSaving = true;
+      _saveError = null;
+    });
 
     final diag = _lastDiagnostic;
     final port = int.tryParse(_portController.text.trim()) ?? 993;
@@ -182,21 +249,134 @@ final class _OrbitMailAccountsSheetState extends State<OrbitMailAccountsSheet> {
       outgoingHost: _selectedProvider.defaultOutgoingHost,
       outgoingPort: _selectedProvider.defaultOutgoingPort,
       useOutgoingSsl: _useSsl,
-      lastVerifiedAtIso: DateTime.now().toIso8601String(),
+      // Endpoint-поля отражают только доступность сервера (отдельное
+      // действие); credential-статус назначает слой состояния.
+      lastVerifiedAtIso: diag == null
+          ? null
+          : DateTime.now().toIso8601String(),
       lastLatencyMs: diag?.latencyMs,
       isActive: true,
-      status: (diag?.isSuccess ?? false)
-          ? OrbitMailAccountStatus.verified
-          : OrbitMailAccountStatus.failed,
+      status: diag == null
+          ? OrbitMailAccountStatus.unverified
+          : (diag.isSuccess
+              ? OrbitMailAccountStatus.verified
+              : OrbitMailAccountStatus.failed),
     );
 
-    widget.onSaveAccount(newAccount);
+    final error = await widget.onSaveAccount(newAccount, password);
+    if (!mounted) return;
+    if (error != null) {
+      setState(() {
+        _isSaving = false;
+        _saveError = error;
+      });
+      return;
+    }
     setState(() {
+      _isSaving = false;
       _accounts = [
         for (final a in _accounts) a.copyWith(isActive: false),
-        newAccount,
+        newAccount.copyWith(
+          credentialStatus: OrbitMailCredentialStatus.savedUnverified,
+          authMethod: 'appPassword',
+        ),
       ];
       _isAddingAccount = false;
+      // Контроллер пароля очищается сразу после успешного save.
+      _passwordController.clear();
+    });
+  }
+
+  /// MAIL-01A: заменить пароль приложения существующего аккаунта.
+  /// Пустое поле = оставить существующий секрет.
+  Future<void> _replacePassword(OrbitMailAccount account) async {
+    if (_isSaving) return;
+    final controller = TextEditingController();
+    String? enteredPassword;
+    var obscured = true;
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (dialogCtx) => StatefulBuilder(
+        builder: (dialogCtx, setDialogState) => AlertDialog(
+          title: const Text('Пароль приложения'),
+          content: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text(
+                'Оставьте поле пустым, чтобы сохранить текущий пароль. '
+                'Введите новый только для замены.',
+                style: TextStyle(
+                  fontSize: 12.5,
+                  color: widget.palette.textSecondary,
+                ),
+              ),
+              const SizedBox(height: 12),
+              TextField(
+                key: const Key('mail-password-replace-input'),
+                controller: controller,
+                obscureText: obscured,
+                autocorrect: false,
+                enableSuggestions: false,
+                autofillHints: const [AutofillHints.password],
+                decoration: InputDecoration(
+                  labelText: 'Новый пароль приложения (необязательно)',
+                  suffixIcon: IconButton(
+                    icon: Icon(
+                      obscured
+                          ? Icons.visibility_off_outlined
+                          : Icons.visibility_outlined,
+                      size: 18,
+                    ),
+                    onPressed: () =>
+                        setDialogState(() => obscured = !obscured),
+                  ),
+                ),
+              ),
+            ],
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.of(dialogCtx).pop(false),
+              child: const Text('Отмена'),
+            ),
+            FilledButton(
+              key: const Key('mail-password-replace-confirm-btn'),
+              onPressed: () {
+                enteredPassword = controller.text;
+                Navigator.of(dialogCtx).pop(true);
+              },
+              child: const Text('Заменить'),
+            ),
+          ],
+        ),
+      ),
+    );
+    // Контроллер (и его текст) уничтожается сразу после диалога.
+    controller.dispose();
+    if (confirmed != true) return;
+    final newPassword = (enteredPassword ?? '').trim();
+    // Пустое поле = «секрет сохранён, замена не требуется».
+    if (newPassword.isEmpty) return;
+    setState(() => _isSaving = true);
+    final error = await widget.onSaveAccount(account, newPassword);
+    if (!mounted) return;
+    if (error != null) {
+      setState(() {
+        _isSaving = false;
+        _saveError = error;
+      });
+      return;
+    }
+    setState(() {
+      _isSaving = false;
+      final idx = _accounts.indexWhere((a) => a.id == account.id);
+      if (idx != -1) {
+        _accounts[idx] = _accounts[idx].copyWith(
+          credentialStatus: OrbitMailCredentialStatus.savedUnverified,
+          authMethod: 'appPassword',
+        );
+      }
     });
   }
 
@@ -462,10 +642,21 @@ final class _OrbitMailAccountsSheetState extends State<OrbitMailAccountsSheet> {
                             size: 20,
                             color: palette.textSecondary,
                           ),
-                          onPressed: () {
-                            HapticFeedback.mediumImpact();
-                            widget.onRemoveAccount(acc.id);
+                          onPressed: () async {
+                            unawaited(HapticFeedback.mediumImpact());
+                            // MAIL-01A: secure-удаление (секрет → metadata
+                            // с компенсацией); ошибка показывается без
+                            // секрета.
+                            final error =
+                                await widget.onRemoveAccount(acc.id);
+                            if (!mounted) return;
                             setState(() {
+                              if (error != null) {
+                                _saveError = error;
+                                // Metadata могла остаться — не трогаем
+                                // локальный список в этом случае.
+                                return;
+                              }
                               _accounts.removeWhere((a) => a.id == acc.id);
                               if (!_accounts.any((a) => a.isActive) &&
                                   _accounts.isNotEmpty) {
@@ -479,6 +670,82 @@ final class _OrbitMailAccountsSheetState extends State<OrbitMailAccountsSheet> {
                     ],
                   ),
                   const SizedBox(height: 10),
+                  // MAIL-01A: credential-статус — отдельная строка, только
+                  // для реальных аккаунтов (demo credential-статусы не
+                  // показывает). Для не-configured аккаунтов тап открывает
+                  // замену пароля.
+                  if (!acc.isDemo)
+                    Padding(
+                      padding: const EdgeInsets.only(bottom: 8),
+                      child: Row(
+                        children: [
+                          OrbitPressable(
+                            key: Key('mail-credential-chip-${acc.id}'),
+                            onTap: () => _replacePassword(acc),
+                            child: Container(
+                              padding: const EdgeInsets.symmetric(
+                                horizontal: 10,
+                                vertical: 6,
+                              ),
+                              decoration: BoxDecoration(
+                                color: acc.credentialStatus ==
+                                        OrbitMailCredentialStatus
+                                            .savedUnverified
+                                    ? Colors.greenAccent.withValues(
+                                        alpha: 0.12,
+                                      )
+                                    : palette.surface.withValues(alpha: 0.4),
+                                borderRadius: BorderRadius.circular(8),
+                                border: Border.all(
+                                  color: acc.credentialStatus ==
+                                          OrbitMailCredentialStatus
+                                              .savedUnverified
+                                      ? Colors.greenAccent.withValues(
+                                          alpha: 0.3,
+                                        )
+                                      : palette.textPrimary.withValues(
+                                          alpha: 0.14,
+                                        ),
+                                ),
+                              ),
+                              child: Row(
+                                children: [
+                                  Icon(
+                                    acc.credentialStatus ==
+                                            OrbitMailCredentialStatus
+                                                .savedUnverified
+                                        ? Icons.key_rounded
+                                        : Icons.key_off_outlined,
+                                    size: 14,
+                                    color: acc.credentialStatus ==
+                                            OrbitMailCredentialStatus
+                                                .savedUnverified
+                                        ? Colors.greenAccent.shade400
+                                        : palette.textSecondary,
+                                  ),
+                                  const SizedBox(width: 6),
+                                  Text(
+                                    acc.credentialStatus.label,
+                                    style: TextStyle(
+                                      fontSize: 11.5,
+                                      fontWeight: FontWeight.w600,
+                                      color: palette.textSecondary,
+                                    ),
+                                  ),
+                                  const SizedBox(width: 4),
+                                  Icon(
+                                    Icons.edit_outlined,
+                                    size: 12,
+                                    color: palette.textSecondary
+                                        .withValues(alpha: 0.6),
+                                  ),
+                                ],
+                              ),
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
                   Container(
                     padding:
                         const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
@@ -500,7 +767,7 @@ final class _OrbitMailAccountsSheetState extends State<OrbitMailAccountsSheet> {
                         const SizedBox(width: 6),
                         Expanded(
                           child: Text(
-                            'IMAP: ${acc.incomingHost}:${acc.incomingPort} • ${acc.useIncomingSsl ? "SSL" : "Plain"}',
+                            'Сервер: ${acc.status.label} • IMAP: ${acc.incomingHost}:${acc.incomingPort} • ${acc.useIncomingSsl ? "SSL" : "Plain"}',
                             maxLines: 1,
                             overflow: TextOverflow.ellipsis,
                             style: TextStyle(
@@ -643,6 +910,111 @@ final class _OrbitMailAccountsSheetState extends State<OrbitMailAccountsSheet> {
           ],
         ),
         const SizedBox(height: 14),
+        // MAIL-01A: пароль приложения — только для Yandex/Mail.ru/custom.
+        // Gmail/Outlook: честный disabled-OAuth, без имитации login/token.
+        if (_providerSupportsAppPassword) ...[
+          TextField(
+            key: const Key('mail-account-password-input'),
+            controller: _passwordController,
+            obscureText: _passwordObscured,
+            autocorrect: false,
+            enableSuggestions: false,
+            autofillHints: const [AutofillHints.password],
+            keyboardType: TextInputType.visiblePassword,
+            style: TextStyle(fontSize: 13, color: palette.textPrimary),
+            decoration: InputDecoration(
+              labelText: 'Пароль приложения',
+              labelStyle: TextStyle(
+                fontSize: 11,
+                color: palette.textSecondary,
+              ),
+              prefixIcon: Icon(
+                Icons.key_rounded,
+                size: 16,
+                color: palette.accent,
+              ),
+              suffixIcon: IconButton(
+                key: const Key('mail-password-visibility-btn'),
+                icon: Icon(
+                  _passwordObscured
+                      ? Icons.visibility_off_outlined
+                      : Icons.visibility_outlined,
+                  size: 18,
+                ),
+                onPressed: () => setState(
+                  () => _passwordObscured = !_passwordObscured,
+                ),
+              ),
+              helperText: 'Секрет хранится только в secure storage устройства',
+              helperStyle: TextStyle(
+                fontSize: 10.5,
+                color: palette.textSecondary.withValues(alpha: 0.8),
+              ),
+              border: OutlineInputBorder(
+                borderRadius: BorderRadius.circular(12),
+              ),
+              isDense: true,
+            ),
+          ),
+        ] else ...[
+          Container(
+            key: const Key('mail-oauth-disabled-note'),
+            padding: const EdgeInsets.all(12),
+            decoration: BoxDecoration(
+              color: palette.surface.withValues(alpha: 0.4),
+              borderRadius: BorderRadius.circular(10),
+              border: Border.all(
+                color: palette.textPrimary.withValues(alpha: 0.14),
+              ),
+            ),
+            child: Row(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Icon(
+                  Icons.lock_outline_rounded,
+                  size: 16,
+                  color: palette.textSecondary,
+                ),
+                const SizedBox(width: 8),
+                Expanded(
+                  child: Text(
+                    'Для ${_selectedProvider.label} вход по OAuth будет '
+                    'добавлен отдельным этапом. Вход по паролю приложения '
+                    'для этого провайдера сейчас недоступен.',
+                    style: TextStyle(
+                      fontSize: 12,
+                      height: 1.35,
+                      color: palette.textSecondary,
+                    ),
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ],
+        if (_saveError != null) ...[
+          const SizedBox(height: 8),
+          Container(
+            key: const Key('mail-save-error'),
+            padding: const EdgeInsets.all(10),
+            decoration: BoxDecoration(
+              color: Colors.redAccent.withValues(alpha: 0.12),
+              borderRadius: BorderRadius.circular(8),
+              border: Border.all(
+                color: Colors.redAccent.withValues(alpha: 0.3),
+              ),
+            ),
+            child: Text(
+              _saveError!,
+              style: const TextStyle(
+                fontSize: 12,
+                color: Colors.redAccent,
+                height: 1.35,
+              ),
+            ),
+          ),
+        ],
+        const SizedBox(height: 14),
         // 4-этапная диагностика сокетов и сертификатов
         OrbitSpatialCard(
           palette: palette,
@@ -780,9 +1152,21 @@ final class _OrbitMailAccountsSheetState extends State<OrbitMailAccountsSheet> {
               palette: palette,
               radius: _radius * 0.7,
               isPrimary: true,
-              icon: Icons.check_circle_outline_rounded,
-              label: 'Сохранить аккаунт',
-              onTap: _isVerifying ? () {} : () => _saveVerifiedAccount(),
+              icon: _isSaving
+                  ? Icons.hourglass_top_rounded
+                  : Icons.check_circle_outline_rounded,
+              label: _isSaving
+                  ? 'Сохранение...'
+                  : (_providerSupportsAppPassword
+                      ? 'Сохранить аккаунт и пароль'
+                      : 'Сохранение недоступно (OAuth — отдельный этап)'),
+              // MAIL-01A: pending state блокирует double submit; для
+              // OAuth-провайдеров сохранение недоступно на этом этапе.
+              onTap:
+                      (_isSaving || _isVerifying ||
+                          !_providerSupportsAppPassword)
+                  ? () {}
+                  : () => _saveAccount(),
             ),
           ],
         ),

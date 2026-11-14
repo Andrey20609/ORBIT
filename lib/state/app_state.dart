@@ -3,22 +3,43 @@ import 'dart:async';
 import 'package:clock/clock.dart';
 import 'package:flutter/material.dart';
 
+import '../core/module_interfaces.dart';
 import '../data/demo_data.dart';
 import '../data/orbit_corrupt_data.dart';
 import '../data/orbit_load_status.dart';
 import '../data/orbit_local_state_codec.dart';
 import '../data/orbit_local_state_repository.dart';
+import '../data/orbit_secure_store.dart';
 import '../services/brain/gemini_brain_engine.dart';
 import '../services/mail/mail_connection_verifier.dart';
+import '../services/mail/orbit_mail_credential_service.dart';
 import 'draft_state.dart';
 
 final class OrbitAppState extends ChangeNotifier {
-  OrbitAppState([OrbitLocalStateRepository? repository])
-    : _repository = repository ?? MemoryLocalStateRepository() {
+  OrbitAppState([OrbitLocalStateRepository? repository, OrbitSecretStore? secretStore])
+    : _repository = repository ?? MemoryLocalStateRepository(),
+      // MAIL-01A: production по умолчанию использует secure storage
+      // (FlutterOrbitSecretStore); тесты подставляют MemoryOrbitSecretStore.
+      _credentials = OrbitMailCredentialService(
+        store: secretStore ?? const FlutterOrbitSecretStore(),
+      ) {
     unawaited(load());
   }
 
   final OrbitLocalStateRepository _repository;
+  final OrbitMailCredentialService _credentials;
+
+  /// MAIL-01A: credential-сервис доступен только чтению состояния — сам
+  /// секрет наружу (UI/модель/снапшот) не отдаётся.
+  @visibleForTesting
+  OrbitMailCredentialService get mailCredentialService => _credentials;
+
+  /// MAIL-01A: test hook — подсчитывающая обёртка верификатора для проверки
+  /// «credential-операции не выполняют сетевых проверок».
+  @visibleForTesting
+  set debugMailVerifierForTest(OrbitMailConnectionVerifier verifier) {
+    _mailVerifier = verifier;
+  }
   List<DemoTask> _tasks = List.of(initialTasks);
   List<DemoEvent> _events = List.of(demoEvents);
   final Set<String> _readEmails = <String>{};
@@ -34,7 +55,7 @@ final class OrbitAppState extends ChangeNotifier {
   final List<OrbitSentMailEntry> _sentEmails = <OrbitSentMailEntry>[];
   final List<OrbitMailAccount> _mailAccounts = List.of(initialMailAccounts);
   final List<BrainChatMessage> _brainChatHistory = <BrainChatMessage>[];
-  final OrbitMailConnectionVerifier _mailVerifier = OrbitMailConnectionVerifier();
+  OrbitMailConnectionVerifier _mailVerifier = OrbitMailConnectionVerifier();
   int _quickActionCounter = 0;
   DraftState _draft = const DraftState();
   DraftState _lastSavedDraft = const DraftState();
@@ -167,6 +188,153 @@ final class OrbitAppState extends ChangeNotifier {
     if (index != -1) {
       _mailAccounts[index] = account;
       _changed();
+    }
+  }
+
+  /// MAIL-01A: сохранить/обновить аккаунт вместе с app password.
+  ///
+  /// Секрет пишется ТОЛЬКО в secure storage (через credential service);
+  /// metadata — через обычный save queue. Компенсация ошибок (fail-closed):
+  /// - падение записи секрета → metadata вообще не трогается;
+  /// - падение metadata save → откат metadata в памяти + удаление нового
+  ///   секрета (или восстановление прежнего из локального backup, который
+  ///   живёт только внутри метода и не попадает в persistent state/логи);
+  /// - успешный результат даёт `credentialStatus = savedUnverified`
+  ///   (настоящая аутентификация появится только в MAIL-02).
+  Future<void> saveMailAccountWithCredentials(
+    OrbitMailAccount account, {
+    String? appPassword,
+  }) async {
+    if (account.id.trim().isEmpty) {
+      throw const OrbitMailCredentialException(
+        'Некорректный идентификатор аккаунта',
+      );
+    }
+    final index = _mailAccounts.indexWhere((a) => a.id == account.id);
+    final isNew = index == -1;
+    final previous = isNew ? null : _mailAccounts[index];
+    final trimmedPassword = (appPassword ?? '').trim();
+    final replacingSecret = trimmedPassword.isNotEmpty;
+
+    if (isNew && !replacingSecret) {
+      throw const OrbitMailCredentialException(
+        'Для нового аккаунта нужен пароль приложения',
+      );
+    }
+
+    // Локальный (только в методе) backup прежнего секрета для отката замены.
+    String? previousSecret;
+    if (replacingSecret && !isNew) {
+      previousSecret = await _credentials.readAppPasswordForTransport(
+        account.id,
+      );
+    }
+
+    // 1. Секрет — только при явной замене.
+    if (replacingSecret) {
+      await _credentials.saveAppPassword(
+        accountId: account.id,
+        appPassword: trimmedPassword,
+      );
+    }
+
+    // 2. Metadata с не-secret credential-статусом.
+    final hasSecret =
+        replacingSecret ||
+        (!isNew && await _credentials.hasAppPassword(account.id));
+    final effective = account.copyWith(
+      credentialStatus: hasSecret
+          ? OrbitMailCredentialStatus.savedUnverified
+          : OrbitMailCredentialStatus.notConfigured,
+      authMethod: hasSecret ? 'appPassword' : null,
+    );
+    if (isNew) {
+      if (effective.isActive) {
+        for (var i = 0; i < _mailAccounts.length; i++) {
+          _mailAccounts[i] = _mailAccounts[i].copyWith(isActive: false);
+        }
+      }
+      _mailAccounts.add(effective);
+    } else {
+      _mailAccounts[index] = effective;
+    }
+    _changed();
+    try {
+      await flush();
+    } catch (_) {
+      // 3. Компенсация: metadata не записались — откатываем память и
+      // возвращаем secure storage в прежнее состояние.
+      if (isNew) {
+        _mailAccounts.removeWhere((a) => a.id == effective.id);
+      } else if (previous != null) {
+        _mailAccounts[index] = previous;
+      }
+      _notify();
+      if (replacingSecret) {
+        try {
+          if (previousSecret != null) {
+            await _credentials.saveAppPassword(
+              accountId: account.id,
+              appPassword: previousSecret,
+            );
+          } else {
+            await _credentials.deleteAppPassword(account.id);
+          }
+        } on OrbitMailCredentialException {
+          throw const OrbitMailCredentialException(
+            'Не удалось сохранить аккаунт; дополнительно не удалось '
+            'восстановить прежнее состояние пароля — повторите попытку',
+          );
+        }
+      }
+      throw const OrbitMailCredentialException(
+        'Не удалось сохранить аккаунт; изменения отменены',
+      );
+    }
+  }
+
+  /// MAIL-01A: удалить аккаунт с гарантиями против orphan-секретов.
+  ///
+  /// - secure delete падает → операция прерывается, metadata остаётся,
+  ///   sanitized error;
+  /// - секрет удалён, metadata delete упал → секрет НЕ восстанавливается
+  ///   (orphan secret не создаётся), аккаунт остаётся в списке как
+  ///   `notConfigured`, ошибка явная.
+  Future<void> removeMailAccountSecurely(String id) async {
+    final index = _mailAccounts.indexWhere((a) => a.id == id);
+    if (index == -1) return;
+    final removed = _mailAccounts[index];
+
+    // 1. Секрет сначала; падение — отмена всей операции.
+    await _credentials.deleteAppPassword(id);
+
+    // 2. Metadata removal + flush.
+    _mailAccounts.removeAt(index);
+    if (removed.isActive && _mailAccounts.isNotEmpty) {
+      _mailAccounts[0] = _mailAccounts[0].copyWith(isActive: true);
+    }
+    _changed();
+    try {
+      await flush();
+    } catch (_) {
+      // 3. Metadata не удалились: возвращаем аккаунт как notConfigured
+      // (секрет уже удалён — orphan secret не создаётся и не восстанавливается).
+      final restoredIndex = index.clamp(0, _mailAccounts.length);
+      _mailAccounts.insert(
+        restoredIndex,
+        removed.copyWith(
+          credentialStatus: OrbitMailCredentialStatus.notConfigured,
+          authMethod: null,
+        ),
+      );
+      if (!_mailAccounts.any((a) => a.isActive) && _mailAccounts.isNotEmpty) {
+        _mailAccounts[0] = _mailAccounts[0].copyWith(isActive: true);
+      }
+      _notify();
+      throw const OrbitMailCredentialException(
+        'Не удалось удалить аккаунт из локальных данных. Пароль приложения '
+        'уже удалён; аккаунт помечен как «Пароль не настроен»',
+      );
     }
   }
 
