@@ -8,6 +8,7 @@ import 'package:intl/date_symbol_data_local.dart';
 import 'package:rive/rive.dart' as rive;
 
 import 'app.dart';
+import 'orbit_startup_dissolve.dart';
 import 'state/app_state.dart';
 import 'visual_engine/orbit_visual_engine.dart';
 import 'visual_engine/rive_capability.dart';
@@ -126,6 +127,7 @@ Future<void> decodeAndPresentStartupBranding({
 
 final class _OrbitBootstrapState extends State<OrbitBootstrap> {
   bool _ready = false;
+  bool _dissolveComplete = false;
   late final StartupFrameGate _frameGate;
   ui.Image? _brandingArtwork;
   Object? _brandingError;
@@ -301,13 +303,61 @@ final class _OrbitBootstrapState extends State<OrbitBootstrap> {
     if (mounted) setState(() {});
   }
 
+  /// STEP6: dissolve only when the environment actually permits animation
+  /// (the resolved quality is not Static and the OS does not disable
+  /// animations). Reduce Motion / Eco / power save / low memory / static
+  /// renderer switch to Today instantly — no controller, no particles, no
+  /// periodic frames. The OS accessibility flag is read from the platform
+  /// dispatcher because the bootstrap sits above any MaterialApp (runApp
+  /// mounts it directly), so MediaQuery.of would never see it.
+  bool _dissolveAllowed(BuildContext context) {
+    if (WidgetsBinding
+        .instance.platformDispatcher.accessibilityFeatures.disableAnimations) {
+      return false;
+    }
+    if ((MediaQuery.maybeDisableAnimationsOf(context) ?? false)) return false;
+    final resolved = widget.quality.resolve(widget.style.settings);
+    if (resolved == ResolvedQuality.static) return false;
+    return true;
+  }
+
   @override
   Widget build(BuildContext context) {
     if (_ready) {
-      return OrbitVisualLabApp(
+      final app = OrbitVisualLabApp(
         style: widget.style,
         quality: widget.quality,
         appState: widget.appState,
+      );
+      // STEP6: Today is built and interactive at the same _ready moment as
+      // before (interactiveTodayMs is untouched); the dissolve overlay sits
+      // on top, ignores input/semantics, plays once and is removed from the
+      // tree on completion. No overlay when animation is not allowed or the
+      // artwork failed to load — those go straight to Today (TZ §7).
+      final artwork = _brandingArtwork;
+      if (_dissolveComplete ||
+          _brandingError != null ||
+          artwork == null ||
+          !_dissolveAllowed(context)) {
+        return app;
+      }
+      return Stack(
+        // Non-directional alignment: the bootstrap sits above any
+        // MaterialApp (runApp mounts it directly), so the Stack must not
+        // depend on Directionality.
+        alignment: Alignment.topLeft,
+        fit: StackFit.expand,
+        children: [
+          app,
+          OrbitStartupDissolveOverlay(
+            key: const Key('orbit-startup-dissolve'),
+            artwork: artwork,
+            onCompleted: () {
+              if (!mounted) return;
+              setState(() => _dissolveComplete = true);
+            },
+          ),
+        ],
       );
     }
     return OrbitStartupShell(
