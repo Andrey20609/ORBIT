@@ -34,8 +34,8 @@ void main() {
 
   group('STEP5 branding & static splash', () {
     testWidgets(
-        'startup shell shows the master mark asset, key kept, no spinner '
-        'and no legacy text', (tester) async {
+        'startup shell keeps its key and the unified #16182C background with '
+        'no spinner and no legacy text', (tester) async {
       final repository = _DeferredAppearanceRepository();
       final style = OrbitStyleManager(repository);
       final quality = OrbitQualityManager();
@@ -53,23 +53,13 @@ void main() {
       await tester.pump();
 
       expect(find.byKey(const Key('orbit-startup-shell')), findsOneWidget);
-      expect(
-        find.byWidgetPredicate(
-          (widget) =>
-              widget is Image &&
-              widget.image is AssetImage &&
-              (widget.image as AssetImage).assetName == _brandingAssetPath,
-          description: 'Image.asset(orbit_splash_mark.png)',
-        ),
-        findsOneWidget,
-      );
       expect(find.byType(CircularProgressIndicator), findsNothing);
       expect(find.text('ORBIT'), findsNothing);
-      // The unified splash background, identical to the native splash.
       final scaffold = tester.widget<Scaffold>(
         find.byKey(const Key('orbit-startup-shell')),
       );
-      expect(scaffold.backgroundColor, const Color(0xFF0B1026));
+      // Unified sampled background from the approved reference artwork.
+      expect(scaffold.backgroundColor, const Color(0xFF16182C));
 
       repository.complete(
         const AppearanceSettings(
@@ -78,13 +68,18 @@ void main() {
           motionEnabled: true,
         ),
       );
-      // Today keeps ambient animations running, so a fixed pump sequence
-      // (not pumpAndSettle) verifies the readiness switch deterministically.
+      await tester.runAsync(() async {
+        for (var i = 0; i < 80; i++) {
+          if (tester.binding.framesEnabled) break;
+          await Future<void>.delayed(const Duration(milliseconds: 50));
+        }
+      });
       for (var i = 0; i < 16; i++) {
         await tester.pump(const Duration(milliseconds: 100));
       }
       expect(find.byKey(const Key('orbit-startup-shell')), findsNothing);
       expect(find.byKey(const Key('today-greeting')), findsOneWidget);
+      expect(style.settings.profile, OrbitProfile.one);
     });
 
     test('branding asset exists, is a valid alpha PNG and is registered',

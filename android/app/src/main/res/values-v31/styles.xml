@@ -1,20 +1,15 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <!-- Android 12+ splash screen: static ORBIT mark on the unified
-         #0B1026 background. "AnimatedIcon" is the API attribute name; the
-         drawable itself is a static vector with no animation. -->
+    <!-- Android 12+ splash screen: the app adaptive icon (the approved
+         artwork) on the unified sampled background. Static, no animation.
+         postSplashScreenTheme is an androidx-only attr and is intentionally
+         not used; the Flutter embedding switches to NormalTheme via
+         meta-data, and NormalTheme uses the same background. -->
     <style name="LaunchTheme" parent="@android:style/Theme.Light.NoTitleBar">
         <item name="android:windowSplashScreenBackground">@color/orbit_splash_background</item>
-        <item name="android:windowSplashScreenAnimatedIcon">@drawable/orbit_splash_mark_inset</item>
-        <item name="android:windowSplashScreenIconBackgroundColor">@color/orbit_splash_background</item>
-        <!-- postSplashScreenTheme is an androidx attr (not in the Android
-             framework) and this step adds no dependencies; the Flutter
-             embedding already switches to NormalTheme via the
-             io.flutter.embedding.android.NormalTheme meta-data, and
-             NormalTheme below uses the same #0B1026 background. -->
+        <item name="android:windowSplashScreenAnimatedIcon">@mipmap/ic_launcher</item>
+        <item name="android:windowSplashScreenIconBackgroundColor">@color/orbit_icon_background</item>
     </style>
-    <!-- Same background as the splash so no white/black flash appears
-         before the first Flutter frame. -->
     <style name="NormalTheme" parent="@android:style/Theme.Light.NoTitleBar">
         <item name="android:windowBackground">@color/orbit_splash_background</item>
     </style>

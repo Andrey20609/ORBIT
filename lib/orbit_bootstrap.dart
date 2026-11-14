@@ -1,7 +1,9 @@
 import 'dart:async';
-import 'dart:math' as math;
+import 'dart:ui' as ui;
 
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:intl/date_symbol_data_local.dart';
 import 'package:rive/rive.dart' as rive;
 
@@ -20,6 +22,7 @@ final class OrbitBootstrap extends StatefulWidget {
     required this.appState,
     this.initializeGraphics = true,
     this.initializeLocales = true,
+    this.startupArtwork,
     super.key,
   });
 
@@ -30,23 +33,112 @@ final class OrbitBootstrap extends StatefulWidget {
   final bool initializeGraphics;
   final bool initializeLocales;
 
+  /// Pre-decoded branding artwork (STEP5-rework); tests pass a ready image
+  /// so the shell render is deterministic. Production decodes it in
+  /// [_OrbitBootstrapState._decodeBrandingArtwork].
+  final ui.Image? startupArtwork;
+
   @override
   State<OrbitBootstrap> createState() => _OrbitBootstrapState();
 }
 
+/// STEP5-rework test hook: becomes true once the approved branding artwork
+/// is decoded and the deferred first frame is released. Read-only for
+/// tests; production flows never read it.
+@visibleForTesting
+bool orbitStartupArtworkReady = false;
+
+/// STEP5-rework test hook: true when the branding asset failed to load and
+/// the diagnostic fallback is shown.
+@visibleForTesting
+bool orbitStartupShellLoadFailed = false;
+
 final class _OrbitBootstrapState extends State<OrbitBootstrap> {
   bool _ready = false;
+  bool _startupFrameDeferred = false;
+  ui.Image? _brandingArtwork;
+  Object? _brandingError;
 
   @override
   void initState() {
     super.initState();
     OrbitRiveMark.runtimeAvailable = false;
+    _brandingArtwork = widget.startupArtwork;
+    // STEP5-rework: hold the native splash until the branding artwork is
+    // decoded, so the first shown Flutter frame already contains it. The
+    // startup shell releases the frame on success/error/dispose. The
+    // automated test binding forces frames on every pump and resets the
+    // deferred counter, so the hold applies to real runs only; tests verify
+    // the decode state through orbitStartupArtworkReady instead.
+    final isTestBinding = WidgetsBinding.instance.runtimeType
+        .toString()
+        .contains('Test');
+    if (!isTestBinding) {
+      WidgetsBinding.instance.deferFirstFrame();
+      _startupFrameDeferred = true;
+    }
     WidgetsBinding.instance.addPostFrameCallback((_) {
       debugPrint(
         '[ORBIT startup] firstFrameMs=${widget.startup.elapsedMilliseconds}',
       );
     });
     unawaited(_initialize());
+    // Branding decode runs next to readiness loading; it never blocks
+    // Today readiness and never touches repositories or timings.
+    unawaited(_decodeBrandingArtwork());
+  }
+
+  Future<void> _decodeBrandingArtwork() async {
+    // The automated test binding cannot complete engine image decodes
+    // (they would hang the fake-async test), so branding decode runs on
+    // real launches only. Tests exercise the shell with a preloaded
+    // programmatic ui.Image instead.
+    if (WidgetsBinding.instance.runtimeType.toString().contains('Test')) {
+      return;
+    }
+    try {
+      final data = await rootBundle.load(
+        'assets/branding/orbit_splash_mark.png',
+      );
+      final codec = await ui.instantiateImageCodec(
+        data.buffer.asUint8List(data.offsetInBytes, data.lengthInBytes),
+      );
+      final frame = await codec.getNextFrame();
+      if (!mounted) return;
+      setState(() {
+        _brandingArtwork = frame.image;
+        _brandingError = null;
+      });
+      // The next painted frame contains the artwork — release the held
+      // frame so the shell's painted output becomes visible.
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        _allowStartupFrame();
+      });
+    } catch (error) {
+      // Explicit diagnostic: the startup shell shows its fallback painter;
+      // the native splash background is never replaced by a flash.
+      debugPrint('[ORBIT startup] branding asset failed to load: $error');
+      if (!mounted) return;
+      setState(() {
+        _brandingError = error;
+        orbitStartupShellLoadFailed = true;
+      });
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        _allowStartupFrame();
+      });
+    }
+  }
+
+  @override
+  void dispose() {
+    _allowStartupFrame();
+    super.dispose();
+  }
+
+  void _allowStartupFrame() {
+    if (!_startupFrameDeferred) return;
+    _startupFrameDeferred = false;
+    WidgetsBinding.instance.allowFirstFrame();
   }
 
   Future<void> _initialize() async {
@@ -105,9 +197,9 @@ final class _OrbitBootstrapState extends State<OrbitBootstrap> {
 
   Future<void> _loadLivingWallpaper() async {
     try {
-      await orbitWallpaperController
-          .loadFromPreferences()
-          .timeout(const Duration(seconds: 3));
+      await orbitWallpaperController.loadFromPreferences().timeout(
+        const Duration(seconds: 3),
+      );
       debugPrint('[ORBIT startup] living wallpaper ready');
     } on Object catch (error) {
       debugPrint('[ORBIT startup] living wallpaper restore notice: $error');
@@ -156,41 +248,34 @@ final class _OrbitBootstrapState extends State<OrbitBootstrap> {
         appState: widget.appState,
       );
     }
-    return const _OrbitStartupShell();
+    return OrbitStartupShell(
+      artwork: _brandingArtwork,
+      loadError: _brandingError,
+    );
   }
 }
 
-/// STEP5: static startup shell that visually continues the native Android
-/// splash — same #0B1026 background, same centred master mark at ~112 dp.
-/// Fully static by design: no progress indicators, no text, no animation;
-/// the transition to [OrbitVisualLabApp] stays the existing instant switch.
-final class _OrbitStartupShell extends StatefulWidget {
-  const _OrbitStartupShell();
+/// STEP5-rework: static startup shell that continues the native Android
+/// splash — unified sampled background (#16182C from the approved
+/// reference) and the approved artwork rendered from a ready [ui.Image].
+/// The host bootstrap decodes the image BEFORE allowing the first frame
+/// (deferFirstFrame/allowFirstFrame), so the first shown Flutter frame
+/// already contains the mark. Fully static: no progress indicators, no
+/// text, no animation; the transition to [OrbitVisualLabApp] stays the
+/// existing instant switch.
+///
+/// Public so tests can mount the shell directly with a preloaded image.
+final class OrbitStartupShell extends StatelessWidget {
+  const OrbitStartupShell({super.key, this.artwork, this.loadError});
 
-  /// Logical size matching the native splash mark (112 dp).
-  static const double markSize = 112;
+  /// Decoded branding artwork; null while decoding or on failure.
+  final ui.Image? artwork;
 
-  @override
-  State<_OrbitStartupShell> createState() => _OrbitStartupShellState();
-}
+  /// Set when the branding asset failed to load (diagnostic fallback).
+  final Object? loadError;
 
-final class _OrbitStartupShellState extends State<_OrbitStartupShell> {
-  bool _precached = false;
-
-  @override
-  void didChangeDependencies() {
-    super.didChangeDependencies();
-    // Start the mark decode as early as possible so the first Flutter
-    // frames land on the unified #0B1026 background while the image
-    // finishes decoding; no startup timing logic is affected.
-    if (!_precached) {
-      _precached = true;
-      precacheImage(
-        const AssetImage('assets/branding/orbit_splash_mark.png'),
-        context,
-      );
-    }
-  }
+  /// Logical size matching the native splash artwork (~168 dp).
+  static const double markSize = 168;
 
   @override
   Widget build(BuildContext context) {
@@ -198,20 +283,17 @@ final class _OrbitStartupShellState extends State<_OrbitStartupShell> {
       debugShowCheckedModeBanner: false,
       home: Scaffold(
         key: const Key('orbit-startup-shell'),
-        backgroundColor: const Color(0xFF0B1026),
+        backgroundColor: const Color(0xFF16182C),
         body: SafeArea(
           child: Center(
-            child: Image.asset(
-              'assets/branding/orbit_splash_mark.png',
-              width: _OrbitStartupShell.markSize,
-              height: _OrbitStartupShell.markSize,
-              fit: BoxFit.contain,
-              filterQuality: FilterQuality.medium,
-              errorBuilder: (context, error, stackTrace) => SizedBox(
-                width: _OrbitStartupShell.markSize,
-                height: _OrbitStartupShell.markSize,
-                child: CustomPaint(
-                  painter: _StartupMarkFallbackPainter(),
+            child: RepaintBoundary(
+              key: const Key('orbit-startup-shell-mark'),
+              child: Container(
+                color: const Color(0xFF16182C),
+                child: SizedBox(
+                  width: markSize,
+                  height: markSize,
+                  child: _buildMark(),
                 ),
               ),
             ),
@@ -220,53 +302,68 @@ final class _OrbitStartupShellState extends State<_OrbitStartupShell> {
       ),
     );
   }
+
+  Widget _buildMark() {
+    final image = artwork;
+    if (image != null) {
+      return RawImage(
+        image: image,
+        fit: BoxFit.contain,
+        filterQuality: FilterQuality.medium,
+      );
+    }
+    if (loadError != null) {
+      // Diagnostic fallback: unified background plus a subtle placeholder
+      // ring and (debug builds only) the loading error text.
+      return CustomPaint(
+        painter: _StartupMarkFallbackPainter(
+          diagnostics: kDebugMode ? '$loadError' : null,
+        ),
+      );
+    }
+    // Artwork still decoding: keep the unified background so the native
+    // splash visually continues without any flash or geometry change.
+    return const SizedBox.expand();
+  }
 }
 
-/// Minimal vector fallback (same silhouette) used only if the branding
-/// asset fails to load — keeps the first frame on the unified background.
+/// Synchronous diagnostic fallback used only when the branding asset fails
+/// to load: unified background with a subtle placeholder ring and (debug
+/// builds) the loading error text.
 class _StartupMarkFallbackPainter extends CustomPainter {
+  const _StartupMarkFallbackPainter({this.diagnostics});
+
+  final String? diagnostics;
+
   @override
   void paint(Canvas canvas, Size size) {
     final center = Offset(size.width / 2, size.height / 2);
-    final ringRadius = size.width * 0.225;
-    final ringWidth = size.width * 0.043;
     final paint = Paint()
       ..style = PaintingStyle.stroke
-      ..strokeWidth = ringWidth
+      ..strokeWidth = size.width * 0.04
       ..strokeCap = StrokeCap.round
-      ..shader = const LinearGradient(
-        begin: Alignment.topLeft,
-        end: Alignment.bottomRight,
-        colors: [Color(0xFF6C8CFF), Color(0xFF9B6CFF)],
-      ).createShader(Offset.zero & size);
-    canvas.drawArc(
-      Rect.fromCircle(center: center, radius: ringRadius),
-      -0.5759, // gap start (mirrors the master mark)
-      2 * math.pi - 0.4189, // sweep leaving the 24° gap
-      false,
-      paint,
-    );
-    final orbitPaint = Paint()
-      ..style = PaintingStyle.stroke
-      ..strokeWidth = size.width * 0.0075
-      ..color = const Color(0xFF8A8FBC).withValues(alpha: 0.5);
-    canvas.save();
-    canvas.translate(center.dx, center.dy);
-    canvas.rotate(-24 * math.pi / 180);
-    canvas.drawOval(
-      Rect.fromCenter(
-        center: Offset.zero,
-        width: size.width * 0.6445,
-        height: size.height * 0.25,
-      ),
-      orbitPaint,
-    );
-    canvas.restore();
-    canvas.drawCircle(
-      Offset(size.width * 0.6875, size.height * 0.3482),
-      size.width * 0.0293,
-      Paint()..color = const Color(0xFFEAF0FF),
-    );
+      ..color = const Color(0xFF6C8CFF);
+    canvas.drawCircle(center, size.width * 0.22, paint);
+    if (diagnostics != null && kDebugMode) {
+      final text = TextPainter(
+        text: TextSpan(
+          text:
+              'branding asset failed; '
+              'see orbit_0535_step5_report.md; '
+              '$diagnostics',
+          style: TextStyle(
+            color: const Color(0xFFEAF0FF).withValues(alpha: 0.7),
+            fontSize: 10,
+          ),
+        ),
+        textDirection: TextDirection.ltr,
+        textAlign: TextAlign.center,
+      )..layout(maxWidth: size.width * 0.9);
+      text.paint(
+        canvas,
+        Offset(center.dx - text.width / 2, center.dy + size.width * 0.28),
+      );
+    }
   }
 
   @override

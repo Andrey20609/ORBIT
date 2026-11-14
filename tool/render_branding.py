@@ -1,159 +1,125 @@
-"""Render the ORBIT master mark to PNGs used by the app.
+"""Render ORBIT branding PNGs from the user-approved reference artwork.
 
-Design source of truth: assets/branding/orbit_icon_master.svg (kept in the
-repository). This script rasterises the same geometry (ring with gap,
-tilted orbit, satellite) with supersampled anti-aliasing and emits:
-  - assets/branding/orbit_splash_mark.png        1024x1024 transparent
-  - res/mipmap-*/ic_launcher.png                 legacy launcher, #0B1026 bg
+Reference source of truth: tool/branding/orbit_icon_reference.jpg
+(SHA-256 8b948d674958df4d582557f1d46a5f02540550a2c6ff2361683c0d3374ff983e,
+2400x1792, user-selected photorealistic glass tor design).
+
+Pipeline (crop -> resize -> minimal tonal correction, content untouched):
+  - assets/branding/orbit_icon_master.png   2048x2048 square production master
+  - assets/branding/orbit_splash_mark.png   1024 rounded-corner splash variant
+  - res/mipmap-*/ic_launcher.png            legacy launcher, full-bleed artwork
+  - res/mipmap-xxxhdpi/ic_launcher_foreground.png  adaptive foreground (108dp@4x)
+  - res/mipmap-xxxhdpi/ic_launcher_monochrome.png  alpha silhouette (A13+)
 
 Run from the project root:  python tool/render_branding.py
-No third-party assets are used; no icon generators are added to pubspec.
+No icon generators are added to pubspec; __pycache__ is not committed.
 """
 from __future__ import annotations
 
 import math
 from pathlib import Path
 
-from PIL import Image, ImageDraw
+from PIL import Image, ImageDraw, ImageEnhance, ImageFilter
 
 ROOT = Path(__file__).resolve().parents[1]
+REFERENCE = ROOT / "tool" / "branding" / "orbit_icon_reference.jpg"
 BRANDING = ROOT / "assets" / "branding"
 RES = ROOT / "android" / "app" / "src" / "main" / "res"
 
-BACKGROUND = (0x0B, 0x10, 0x26)
-BLUE = (0x6C, 0x8C, 0xFF)
-VIOLET = (0x9B, 0x6C, 0xFF)
-ORBIT_INK = (0x8A, 0x8F, 0xBC)
-SATELLITE = (0xEA, 0xF0, 0xFF)
+# Sampled from the dark edge of the approved reference (bottom corners).
+SPLASH_BACKGROUND = "#16182C"
 
-CENTER = 512.0
-RING_RADIUS = 230.0
-RING_WIDTH = 44.0
-GAP_CENTER_DEG = -45.0  # upper-right, screen coordinates (y down)
-GAP_SPAN_DEG = 24.0
-ORBIT_RX = 330.0
-ORBIT_RY = 128.0
-ORBIT_ROT_DEG = -24.0
-ORBIT_WIDTH = 8.0
-SATELLITE_RADIUS = 30.0
-SATELLITE_AT_DEG = -50.0
+# Square crop around the rounded-square icon of the reference. Only the
+# outer field of the original is removed; the tor is centred and untouched.
+CROP_BOX = (435, 180, 1965, 1710)  # 1530x1530
+MASTER_SIZE = 2048
 
-SUPERSAMPLE = 4  # 4096 px render, downsampled -> clean anti-aliasing
+LEGACY_DENSITIES = {
+    "mdpi": 48,
+    "hdpi": 72,
+    "xhdpi": 96,
+    "xxhdpi": 144,
+    "xxxhdpi": 192,
+}
+ADAPTIVE_FOREGROUND_SIZE = 432  # 108 dp @ xxxhdpi
+SPLASH_MARK_SIZE = 1024
 
 
-def _gradient_at(angle_deg: float) -> tuple[int, int, int]:
-    """Blue->violet interpolation along the ring (0 deg at east, cw)."""
-    t = (angle_deg % 360.0) / 360.0
-    return tuple(round(BLUE[i] + (VIOLET[i] - BLUE[i]) * t) for i in range(3))
+def load_reference() -> Image.Image:
+    img = Image.open(REFERENCE)
+    img = img.convert("RGB")
+    return img.crop(CROP_BOX)
 
 
-def _draw_mark(draw: ImageDraw.ImageDraw, scale: float, size: int,
-               background: tuple[int, int, int] | None) -> None:
-    if background is not None:
-        draw.rectangle([0, 0, size - 1, size - 1], fill=background)
-
-    # All master-geometry constants live in the 1024 space; scale once.
-    center = CENTER * scale
-    ring_r = RING_RADIUS * scale
-    ring_w = RING_WIDTH * scale
-    orbit_rx = ORBIT_RX * scale
-    orbit_ry = ORBIT_RY * scale
-    orbit_w = max(1, round(ORBIT_WIDTH * scale))
-    sat_r = SATELLITE_RADIUS * scale
-
-    # Tilted orbit ellipse (thin, subtle).
-    rot = math.radians(ORBIT_ROT_DEG)
-    cos_r, sin_r = math.cos(rot), math.sin(rot)
-    points = []
-    for i in range(721):
-        t = 2 * math.pi * i / 720
-        x = orbit_rx * math.cos(t)
-        y = orbit_ry * math.sin(t)
-        px = center + x * cos_r - y * sin_r
-        py = center + x * sin_r + y * cos_r
-        points.append((px, py))
-    draw.line(points, fill=(*ORBIT_INK, 128), width=orbit_w)
-
-    # Satellite glow (soft, decorative).
-    sat_angle = math.radians(SATELLITE_AT_DEG)
-    sx = center + orbit_rx * math.cos(sat_angle) * cos_r - \
-        orbit_ry * math.sin(sat_angle) * sin_r
-    sy = center + orbit_rx * math.cos(sat_angle) * sin_r + \
-        orbit_ry * math.sin(sat_angle) * cos_r
-    glow_r = sat_r * 2.6
-    for layer in range(6, 0, -1):
-        alpha = 8 * layer
-        f = layer / 6
-        draw.ellipse(
-            [sx - glow_r * f, sy - glow_r * f,
-             sx + glow_r * f, sy + glow_r * f],
-            fill=(*SATELLITE, alpha),
-        )
-
-    # Broken ring: per-angle wedges give per-pixel gradient colours.
-    gap_half = math.radians(GAP_SPAN_DEG / 2)
-    gap_center = math.radians(GAP_CENTER_DEG)
-    start = gap_center + gap_half
-    end = gap_center - gap_half + 2 * math.pi
-    outer = ring_r + ring_w / 2
-    hole = ring_r - ring_w / 2
-    cap = math.radians(2.2)  # rounded caps near the gap ends
-    step = (end - start) / 1440
-    for i in range(1441):
-        angle = start + step * i
-        colour = _gradient_at(math.degrees(angle))
-        a0 = angle - min(0.0025, step) - cap * 0.12
-        a1 = angle + min(0.0025, step) + cap * 0.12
-        draw.pieslice(
-            [center - outer, center - outer, center + outer, center + outer],
-            math.degrees(a0), math.degrees(a1),
-            fill=(*colour, 255),
-        )
-    # Punch the inner hole back out (pieslice drew full wedges).
-    hole_fill = (*background, 255) if background is not None else (0, 0, 0, 0)
-    draw.ellipse([center - hole, center - hole,
-                  center + hole, center + hole], fill=hole_fill)
-
-    # Satellite body (opaque, on top).
-    draw.ellipse([sx - sat_r, sy - sat_r, sx + sat_r, sy + sat_r],
-                 fill=(*SATELLITE, 255))
+def build_master(reference: Image.Image) -> Image.Image:
+    """2048x2048 square production master with minimal tonal correction."""
+    master = reference.resize((MASTER_SIZE, MASTER_SIZE), Image.LANCZOS)
+    # Minimal tonal correction: slightly deepen contrast so the glass tor
+    # keeps presence at small launcher sizes (content unchanged).
+    master = ImageEnhance.Contrast(master).enhance(1.04)
+    master = ImageEnhance.Brightness(master).enhance(0.99)
+    return master
 
 
-def render_mark(size: int) -> Image.Image:
-    """Transparent render of the master mark at the requested size."""
-    big = size * SUPERSAMPLE
-    canvas = Image.new("RGBA", (big, big), (0, 0, 0, 0))
-    draw = ImageDraw.Draw(canvas)
-    _draw_mark(draw, big / 1024.0, big, None)
-    return canvas.resize((size, size), Image.LANCZOS)
+def rounded(img: Image.Image, radius_frac: float) -> Image.Image:
+    mask = Image.new("L", img.size, 0)
+    d = ImageDraw.Draw(mask)
+    d.rounded_rectangle(
+        [0, 0, img.size[0] - 1, img.size[1] - 1],
+        radius=int(img.size[0] * radius_frac),
+        fill=255,
+    )
+    out = Image.new("RGBA", img.size, (0, 0, 0, 0))
+    out.paste(img, (0, 0), mask)
+    return out
 
 
-def render_launcher(size: int) -> Image.Image:
-    """Legacy launcher PNG: #0B1026 background + centred mark."""
-    big = size * SUPERSAMPLE
-    canvas = Image.new("RGBA", (big, big), (*BACKGROUND, 255))
-    mark = render_mark(size * SUPERSAMPLE).resize((big, big), Image.LANCZOS)
-    canvas.alpha_composite(mark)
-    return canvas.convert("RGB").resize((size, size), Image.LANCZOS)
+def build_monochrome(master: Image.Image) -> Image.Image:
+    """Alpha silhouette of the tor + orbit trails (white, luminance-based)."""
+    grey = master.convert("L")
+    # Normalise around the dark background so the glass tor and the light
+    # orbit trails become the bright part of the silhouette.
+    min_l, max_l = grey.getextrema()
+    span = max(1, max_l - min_l)
+    boosted = grey.point(lambda v: min(255, int((v - min_l) / span * 300)))
+    boosted = boosted.filter(ImageFilter.GaussianBlur(2))
+    silhouette = Image.new("RGBA", master.size, (255, 255, 255, 0))
+    silhouette.putalpha(boosted)
+    return silhouette
 
 
 def main() -> None:
     BRANDING.mkdir(parents=True, exist_ok=True)
-    render_mark(1024).save(BRANDING / "orbit_splash_mark.png")
+    reference = load_reference()
 
-    densities = {
-        "mdpi": 48,
-        "hdpi": 72,
-        "xhdpi": 96,
-        "xxhdpi": 144,
-        "xxxhdpi": 192,
-    }
-    for density, size in densities.items():
+    master = build_master(reference)
+    master.save(BRANDING / "orbit_icon_master.png")
+
+    splash = rounded(master.resize((SPLASH_MARK_SIZE, SPLASH_MARK_SIZE),
+                                  Image.LANCZOS), 0.22)
+    splash.save(BRANDING / "orbit_splash_mark.png")
+
+    adaptive_foreground = master.resize(
+        (ADAPTIVE_FOREGROUND_SIZE, ADAPTIVE_FOREGROUND_SIZE), Image.LANCZOS)
+    foreground_folder = RES / "mipmap-xxxhdpi"
+    foreground_folder.mkdir(parents=True, exist_ok=True)
+    adaptive_foreground.save(foreground_folder / "ic_launcher_foreground.png")
+
+    mono = build_monochrome(master).resize(
+        (ADAPTIVE_FOREGROUND_SIZE, ADAPTIVE_FOREGROUND_SIZE), Image.LANCZOS)
+    mono.save(foreground_folder / "ic_launcher_monochrome.png")
+
+    for density, size in LEGACY_DENSITIES.items():
         folder = RES / f"mipmap-{density}"
         folder.mkdir(parents=True, exist_ok=True)
-        render_launcher(size).save(folder / "ic_launcher.png")
+        master.resize((size, size), Image.LANCZOS).save(
+            folder / "ic_launcher.png")
         print(f"ic_launcher.png {density} {size}x{size}")
-    print("orbit_splash_mark.png 1024x1024")
+
+    print(f"orbit_icon_master.png {MASTER_SIZE}x{MASTER_SIZE}")
+    print(f"orbit_splash_mark.png {SPLASH_MARK_SIZE} rounded")
+    print(f"adaptive foreground/monochrome {ADAPTIVE_FOREGROUND_SIZE}px")
+    print(f"splash background colour: {SPLASH_BACKGROUND}")
 
 
 if __name__ == "__main__":
