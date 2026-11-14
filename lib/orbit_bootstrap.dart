@@ -53,9 +53,80 @@ bool orbitStartupArtworkReady = false;
 @visibleForTesting
 bool orbitStartupShellLoadFailed = false;
 
+/// STEP5-rework: production decode path for the branding artwork — the
+/// same rootBundle.load -> instantiateImageCodec chain the bootstrap runs
+/// on real launches. Extracted so tests exercise the exact production
+/// decode (success and failure) without the automated test binding.
+@visibleForTesting
+Future<ui.Image> decodeBrandingArtworkAsset([AssetBundle? bundle]) async {
+  final assetBundle = bundle ?? rootBundle;
+  final data = await assetBundle.load('assets/branding/orbit_splash_mark.png');
+  final codec = await ui.instantiateImageCodec(
+    data.buffer.asUint8List(data.offsetInBytes, data.lengthInBytes),
+  );
+  final frame = await codec.getNextFrame();
+  return frame.image;
+}
+
+/// STEP5-rework: state machine for holding the native splash until the
+/// branding artwork is ready. `hold` pairs with the platform
+/// deferFirstFrame, `release` with allowFirstFrame (idempotent: a second
+/// release is a no-op). Tests inject counters for onHold/onRelease so the
+/// pairing is verified without the automated test binding.
+@visibleForTesting
+class StartupFrameGate {
+  StartupFrameGate({void Function()? onHold, void Function()? onRelease})
+    : _onHold = onHold,
+      _onRelease = onRelease;
+
+  final void Function()? _onHold;
+  final void Function()? _onRelease;
+  bool _held = false;
+
+  bool get isHeld => _held;
+
+  void hold() {
+    if (_held) return;
+    _held = true;
+    _onHold?.call();
+  }
+
+  void release() {
+    if (!_held) return;
+    _held = false;
+    _onRelease?.call();
+  }
+}
+
+/// STEP5-rework: production presentation flow for the branding artwork —
+/// decode via [decodeBrandingArtworkAsset], surface the result through
+/// [onArtworkReady]/[onArtworkError] (the host setState) and release
+/// [frameGate] on the next painted frame in BOTH paths, so the first shown
+/// frame already contains the artwork and a failed asset can never leave
+/// the app on a held frame. [_OrbitBootstrapState._decodeBrandingArtwork]
+/// delegates here with rootBundle; tests inject a bundle (real or failing)
+/// and counter-backed callbacks to verify the exact production
+/// success/failure/release behaviour against the test binding.
+@visibleForTesting
+Future<void> decodeAndPresentStartupBranding({
+  required StartupFrameGate frameGate,
+  required void Function(ui.Image image) onArtworkReady,
+  required void Function(Object error) onArtworkError,
+  AssetBundle? bundle,
+}) async {
+  try {
+    final image = await decodeBrandingArtworkAsset(bundle);
+    onArtworkReady(image);
+    WidgetsBinding.instance.addPostFrameCallback((_) => frameGate.release());
+  } catch (error) {
+    onArtworkError(error);
+    WidgetsBinding.instance.addPostFrameCallback((_) => frameGate.release());
+  }
+}
+
 final class _OrbitBootstrapState extends State<OrbitBootstrap> {
   bool _ready = false;
-  bool _startupFrameDeferred = false;
+  late final StartupFrameGate _frameGate;
   ui.Image? _brandingArtwork;
   Object? _brandingError;
 
@@ -69,13 +140,17 @@ final class _OrbitBootstrapState extends State<OrbitBootstrap> {
     // startup shell releases the frame on success/error/dispose. The
     // automated test binding forces frames on every pump and resets the
     // deferred counter, so the hold applies to real runs only; tests verify
-    // the decode state through orbitStartupArtworkReady instead.
+    // the identical gate/decode flow through decodeAndPresentStartupBranding
+    // with injected callbacks instead.
+    _frameGate = StartupFrameGate(
+      onHold: () => WidgetsBinding.instance.deferFirstFrame(),
+      onRelease: () => WidgetsBinding.instance.allowFirstFrame(),
+    );
     final isTestBinding = WidgetsBinding.instance.runtimeType
         .toString()
         .contains('Test');
     if (!isTestBinding) {
-      WidgetsBinding.instance.deferFirstFrame();
-      _startupFrameDeferred = true;
+      _frameGate.hold();
     }
     WidgetsBinding.instance.addPostFrameCallback((_) {
       debugPrint(
@@ -91,54 +166,41 @@ final class _OrbitBootstrapState extends State<OrbitBootstrap> {
   Future<void> _decodeBrandingArtwork() async {
     // The automated test binding cannot complete engine image decodes
     // (they would hang the fake-async test), so branding decode runs on
-    // real launches only. Tests exercise the shell with a preloaded
-    // programmatic ui.Image instead.
+    // real launches only. The test suite exercises the identical
+    // production flow through decodeAndPresentStartupBranding with an
+    // injected bundle and counter-backed gate (see
+    // test/drift_mail_step5_rework_test.dart).
     if (WidgetsBinding.instance.runtimeType.toString().contains('Test')) {
       return;
     }
-    try {
-      final data = await rootBundle.load(
-        'assets/branding/orbit_splash_mark.png',
-      );
-      final codec = await ui.instantiateImageCodec(
-        data.buffer.asUint8List(data.offsetInBytes, data.lengthInBytes),
-      );
-      final frame = await codec.getNextFrame();
-      if (!mounted) return;
-      setState(() {
-        _brandingArtwork = frame.image;
-        _brandingError = null;
-      });
-      // The next painted frame contains the artwork — release the held
-      // frame so the shell's painted output becomes visible.
-      WidgetsBinding.instance.addPostFrameCallback((_) {
-        _allowStartupFrame();
-      });
-    } catch (error) {
-      // Explicit diagnostic: the startup shell shows its fallback painter;
-      // the native splash background is never replaced by a flash.
-      debugPrint('[ORBIT startup] branding asset failed to load: $error');
-      if (!mounted) return;
-      setState(() {
-        _brandingError = error;
-        orbitStartupShellLoadFailed = true;
-      });
-      WidgetsBinding.instance.addPostFrameCallback((_) {
-        _allowStartupFrame();
-      });
-    }
+    await decodeAndPresentStartupBranding(
+      frameGate: _frameGate,
+      onArtworkReady: (image) {
+        orbitStartupArtworkReady = true;
+        if (!mounted) return;
+        setState(() {
+          _brandingArtwork = image;
+          _brandingError = null;
+        });
+      },
+      onArtworkError: (error) {
+        // Explicit diagnostic: the startup shell shows its fallback
+        // painter; the native splash background is never replaced by a
+        // flash.
+        debugPrint('[ORBIT startup] branding asset failed to load: $error');
+        if (!mounted) return;
+        setState(() {
+          _brandingError = error;
+          orbitStartupShellLoadFailed = true;
+        });
+      },
+    );
   }
 
   @override
   void dispose() {
-    _allowStartupFrame();
+    _frameGate.release();
     super.dispose();
-  }
-
-  void _allowStartupFrame() {
-    if (!_startupFrameDeferred) return;
-    _startupFrameDeferred = false;
-    WidgetsBinding.instance.allowFirstFrame();
   }
 
   Future<void> _initialize() async {

@@ -11,21 +11,17 @@ import 'package:orbit_visual_lab/orbit_bootstrap.dart';
 import 'package:orbit_visual_lab/state/app_state.dart';
 import 'package:orbit_visual_lab/visual_engine/orbit_visual_engine.dart';
 
-const _brandingAssetPath = 'assets/branding/orbit_splash_mark.png';
 const _backgroundSample = <int>[0x16, 0x18, 0x2C]; // #16182C
 const _referenceSha256 =
     '8b948d674958df4d582557f1d46a5f02540550a2c6ff2361683c0d3374ff983e';
 
-/// Decodes the ACTUAL production branding asset (orbit_splash_mark.png)
-/// with real engine time — the same file and decode path the production
-/// bootstrap uses (rootBundle.load -> instantiateImageCodec -> frame).
-Future<ui.Image> decodeRealBrandingAsset() async {
-  final data = await rootBundle.load(_brandingAssetPath);
-  final codec = await ui.instantiateImageCodec(
-    data.buffer.asUint8List(data.offsetInBytes, data.lengthInBytes),
-  );
-  final frame = await codec.getNextFrame();
-  return frame.image;
+/// Asset bundle that always fails, mirroring a missing/corrupt branding
+/// asset so the production decode path's failure branch is exercised.
+final class _FailingBundle extends CachingAssetBundle {
+  @override
+  Future<ByteData> load(String key) async {
+    throw StateError('branding asset unavailable in test: $key');
+  }
 }
 
 final class _DeferredAppearanceRepository implements OrbitAppearanceRepository {
@@ -90,66 +86,52 @@ Future<void> _pumpStartupShell(
   await tester.pump();
 }
 
-
-/// Minimal PNG encoder: truecolour RGB with a filter byte per scanline
-/// (sufficient for the evidence capture; alpha dropped as background is
-/// opaque #16182C inside the shell).
-List<int> _encodePng(int width, int height, Uint8List rgba) {
-  final raw = <int>[];
-  for (var y = 0; y < height; y++) {
-    raw.add(0); // filter type none
-    for (var x = 0; x < width; x++) {
-      final i = (y * width + x) * 4;
-      raw.addAll([rgba[i], rgba[i + 1], rgba[i + 2]]);
-    }
-  }
-  List<int> chunk(String type, List<int> body) {
-    final len = body.length;
-    final out = <int>[
-      (len >> 24) & 0xFF, (len >> 16) & 0xFF, (len >> 8) & 0xFF, len & 0xFF,
-    ];
-    final typeBytes = type.codeUnits;
-    out.addAll(typeBytes);
-    out.addAll(body);
-    var crc = 0xFFFFFFFF;
-    for (final b in [...typeBytes, ...body]) {
-      crc ^= b;
-      for (var bit = 0; bit < 8; bit++) {
-        crc = (crc >> 1) ^ (0xEDB88320 & -(crc & 1));
-      }
-    }
-    crc ^= 0xFFFFFFFF;
-    out.addAll([
-      (crc >> 24) & 0xFF, (crc >> 16) & 0xFF, (crc >> 8) & 0xFF, crc & 0xFF,
-    ]);
-    return out;
-  }
-
-  final ihdr = <int>[
-    (width >> 24) & 0xFF, (width >> 16) & 0xFF, (width >> 8) & 0xFF,
-    width & 0xFF,
-    (height >> 24) & 0xFF, (height >> 16) & 0xFF, (height >> 8) & 0xFF,
-    height & 0xFF,
-    8, 2, 0, 0, 0, // bit depth 8, colour type 2 (RGB)
-  ];
-  final zlibData = ZLibEncoder(raw: false).convert(raw);
-  final out = <int>[0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A];
-  out.addAll(chunk('IHDR', ihdr));
-  out.addAll(chunk('IDAT', zlibData));
-  out.addAll(chunk('IEND', const []));
-  return out;
-}
-
 void main() {
   // Live binding: real frames and real async so engine image decodes and
   // RepaintBoundary captures work deterministically in this file.
   LiveTestWidgetsFlutterBinding.ensureInitialized();
 
-  group('STEP5-rework branding & static splash (real raster artwork)', () {
+  setUp(() {
+    orbitStartupArtworkReady = false;
+    orbitStartupShellLoadFailed = false;
+  });
+
+  group('STEP5-rework branding & static splash (production decode flow)', () {
+    test('[Gate] StartupFrameGate: hold/release pairing is idempotent and '
+        'fires each callback exactly once', () {
+      var holds = 0;
+      var releases = 0;
+      final gate = StartupFrameGate(
+        onHold: () => holds++,
+        onRelease: () => releases++,
+      );
+      expect(gate.isHeld, isFalse);
+      expect(holds, 0);
+
+      gate.hold();
+      expect(gate.isHeld, isTrue);
+      expect(holds, 1);
+
+      gate.hold(); // idempotent: a second hold is a no-op
+      expect(holds, 1);
+
+      gate.release();
+      expect(gate.isHeld, isFalse);
+      expect(releases, 1);
+
+      gate.release(); // idempotent: a second release is a no-op
+      expect(releases, 1, reason: 'allowFirstFrame must never be '
+          'over-called — that assertion crashes real launches');
+      expect(holds, 1);
+    });
+
     testWidgets('[R1] first rendered frame contains the actual artwork '
         'pixels, not an empty background', (tester) async {
-      final artwork = await decodeRealBrandingAsset();
-      await _pumpStartupShellDirect(tester, artwork);
+      // Production decode path (decodeBrandingArtworkAsset -> rootBundle ->
+      // instantiateImageCodec) against the actual orbit_splash_mark.png.
+      final artwork = await tester.runAsync(() => decodeBrandingArtworkAsset());
+      expect(artwork, isNotNull);
+      await _pumpStartupShellDirect(tester, artwork!);
 
       final nonBackground = await _countNonBackgroundPixels(
         tester,
@@ -162,7 +144,8 @@ void main() {
 
     testWidgets('[R2] no async blank: pre-decode frame is the unified '
         'background; decoded frame carries the actual artwork', (tester) async {
-      // Stage 1: no artwork — the shell is the unified background only.
+      // Stage 1: no artwork — the shell is the unified background only
+      // (the deferred frame is still held; nothing painted yet).
       await tester.pumpWidget(const OrbitStartupShell());
       await tester.pump();
       expect(orbitStartupArtworkReady, isFalse);
@@ -177,7 +160,9 @@ void main() {
           reason: 'pre-decode frame must be the unified background');
 
       // Stage 2: the decoded ACTUAL asset in the very first available frame.
-      await tester.pumpWidget(OrbitStartupShell(artwork: await decodeRealBrandingAsset()));
+      final artwork = await tester.runAsync(() => decodeBrandingArtworkAsset());
+      expect(artwork, isNotNull);
+      await tester.pumpWidget(OrbitStartupShell(artwork: artwork));
       await tester.pump();
       final nonBackground = await _countNonBackgroundPixels(
         tester,
@@ -187,30 +172,65 @@ void main() {
           reason: 'the first available frame must show the artwork');
     });
 
-    testWidgets('[R3] asset failure unlocks the frame with a diagnostic '
-        'fallback and never hangs', (tester) async {
-      // No artwork + explicit loadError: the shell shows the diagnostic
-      // fallback painter synchronously (the host bootstrap releases the
-      // deferred frame on this same error path in production).
-      await tester.pumpWidget(
-        const OrbitStartupShell(
-          loadError: 'branding asset failed in test',
+    testWidgets('[R3] production decode FAILURE: the frame gate releases, '
+        'the error is surfaced and the fallback painter is visible', (
+      tester,
+    ) async {
+      var holds = 0;
+      var releases = 0;
+      final gate = StartupFrameGate(
+        onHold: () => holds++,
+        onRelease: () => releases++,
+      );
+      gate.hold(); // mirrors OrbitBootstrap.initState on real launches
+
+      Object? reportedError;
+      ui.Image? readyImage;
+      await tester.runAsync(
+        () => decodeAndPresentStartupBranding(
+          frameGate: gate,
+          bundle: _FailingBundle(),
+          onArtworkReady: (image) => readyImage = image,
+          onArtworkError: (error) => reportedError = error,
         ),
       );
-      await tester.pump();
+      await tester.pump(); // fires the post-frame gate release
 
+      expect(readyImage, isNull);
+      expect(reportedError, isNotNull);
+      expect(releases, 1,
+          reason: 'a failed asset must release the deferred frame too — '
+              'the app must never stay on the held splash');
+      expect(gate.isHeld, isFalse);
+      // The injected flow owns no global flags; the production bootstrap
+      // callback (which sets orbitStartupShellLoadFailed) is not mounted
+      // here, so the ready flag must still be untouched.
+      expect(orbitStartupArtworkReady, isFalse);
+
+      // The shell with loadError renders the diagnostic fallback painter —
+      // a visible, non-blank frame (never an empty screen and no hang).
+      await tester.pumpWidget(
+        const OrbitStartupShell(loadError: 'branding asset failed in test'),
+      );
+      await tester.pump();
       expect(find.byType(CustomPaint), findsWidgets);
       expect(find.byType(RawImage), findsNothing,
           reason: 'fallback painter replaces the missing artwork');
+      final fallbackPixels = await _countNonBackgroundPixels(
+        tester,
+        const Key('orbit-startup-shell-mark'),
+      );
+      expect(fallbackPixels, greaterThan(200),
+          reason: 'the failure frame must be visible, not blank');
     });
 
-    testWidgets('[R4] readiness unchanged: Today appears after actual '
-        'loading', (tester) async {
+    testWidgets('[R4] readiness unchanged: app mounts, does not hang and '
+        'reaches Today after actual loading', (tester) async {
       final repository = _DeferredAppearanceRepository();
       await _pumpStartupShell(
         tester,
         repository: repository,
-        artwork: await decodeRealBrandingAsset(),
+        artwork: (await tester.runAsync(() => decodeBrandingArtworkAsset()))!,
       );
 
       expect(find.byKey(const Key('today-greeting')), findsNothing);
@@ -227,13 +247,16 @@ void main() {
       }
       expect(find.byKey(const Key('orbit-startup-shell')), findsNothing);
       expect(find.byKey(const Key('today-greeting')), findsOneWidget);
+      expect(orbitStartupShellLoadFailed, isFalse,
+          reason: 'a normal mount must not trip the failure flag');
     });
 
     testWidgets('[R5] static only: no periodic frames from branding', (
       tester,
     ) async {
-      final artwork = await decodeRealBrandingAsset();
-      await _pumpStartupShellDirect(tester, artwork);
+      final artwork = await tester.runAsync(() => decodeBrandingArtworkAsset());
+      expect(artwork, isNotNull);
+      await _pumpStartupShellDirect(tester, artwork!);
 
       // Static proof: two captures 2 s apart are byte-identical, i.e. the
       // branding adds no animation controllers or periodic frames.
@@ -255,41 +278,6 @@ void main() {
           .asUint8List();
       expect(secondBytes, firstBytes,
           reason: 'branding must not introduce periodic frame changes');
-    });
-
-    testWidgets('[R7-evidence] capture first Flutter frame with the actual '
-        'artwork to evidence/step5_flutter_shell.png', (tester) async {
-      final repository = _DeferredAppearanceRepository();
-      final style = OrbitStyleManager(repository);
-      final quality = OrbitQualityManager();
-      addTearDown(quality.dispose);
-      final artwork = await tester.runAsync(decodeRealBrandingAsset);
-      await tester.pumpWidget(
-        OrbitBootstrap(
-          startup: Stopwatch()..start(),
-          style: style,
-          quality: quality,
-          appState: OrbitAppState(MemoryLocalStateRepository()),
-          initializeGraphics: false,
-          initializeLocales: false,
-          startupArtwork: artwork,
-        ),
-      );
-      await tester.pump();
-
-      final boundary = tester.renderObject<RenderRepaintBoundary>(
-        find.byKey(const Key('orbit-startup-shell-mark')),
-      );
-      final image = await boundary.toImage(pixelRatio: 2.0);
-      final bytes =
-          (await image.toByteData(format: ui.ImageByteFormat.rawRgba))!;
-      final width = image.width;
-      final height = image.height;
-      final png = _encodePng(width, height, bytes.buffer.asUint8List());
-      final evidenceFile = File(
-          '../ORBIT_0.5.35+41_step5_rework_review/evidence/step5_flutter_shell.png');
-      await evidenceFile.writeAsBytes(png);
-      expect(evidenceFile.existsSync(), isTrue);
     });
 
     test('[R6] provenance: master/splash generated from the approved '
@@ -314,6 +302,13 @@ void main() {
       expect(mWidth, 2048);
       expect(mHeight, 2048);
 
+      final splash = File('assets/branding/orbit_splash_mark.png');
+      expect(splash.existsSync(), isTrue);
+      final splashBytes = splash.readAsBytesSync();
+      final sWidth = (splashBytes[16] << 24) | (splashBytes[17] << 16) |
+          (splashBytes[18] << 8) | splashBytes[19];
+      expect(sWidth, 1024);
+
       final densities = <String, int>{
         'mdpi': 48,
         'hdpi': 72,
@@ -333,15 +328,38 @@ void main() {
       }
     });
 
-    testWidgets('[R7] production decode path: the bootstrap-provided '
-        'artifact decodes the actual branding asset', (tester) async {
-      // Production decode path (the same rootBundle.load ->
-      // instantiateImageCodec chain the bootstrap runs on real launches)
-      // against the actual orbit_splash_mark.png.
-      final artwork = await tester.runAsync(decodeRealBrandingAsset);
-      expect(artwork, isNotNull);
-      expect(artwork!.width, greaterThan(0));
-      expect(artwork.height, greaterThan(0));
+    testWidgets('[R7] production decode SUCCESS: actual asset decodes, '
+        'artwork is surfaced and the gate releases after the painted frame', (
+      tester,
+    ) async {
+      var holds = 0;
+      var releases = 0;
+      final gate = StartupFrameGate(
+        onHold: () => holds++,
+        onRelease: () => releases++,
+      );
+      gate.hold(); // mirrors OrbitBootstrap.initState on real launches
+
+      ui.Image? readyImage;
+      Object? reportedError;
+      await tester.runAsync(
+        () => decodeAndPresentStartupBranding(
+          frameGate: gate,
+          onArtworkReady: (image) => readyImage = image,
+          onArtworkError: (error) => reportedError = error,
+        ),
+      );
+      await tester.pump(); // fires the post-frame gate release
+
+      expect(reportedError, isNull);
+      expect(readyImage, isNotNull);
+      // The production asset is the 1024 px rounded splash mark.
+      expect(readyImage!.width, 1024);
+      expect(readyImage!.height, 1024);
+      expect(releases, 1,
+          reason: 'the deferred frame must be released once the artwork '
+              'frame is painted');
+      expect(gate.isHeld, isFalse);
     });
   });
 }
