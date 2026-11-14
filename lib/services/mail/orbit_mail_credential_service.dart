@@ -135,6 +135,13 @@ final class OrbitMailCredentialService {
         'Нельзя сохранить токены без идентификатора аккаунта',
       );
     }
+    // MAIL-01B r2 fix (блокер 3): пустой access token не является
+    // валидным секретом — сохранение отклоняется.
+    if (tokens.accessToken.isEmpty) {
+      throw const OrbitMailCredentialException(
+        'Нельзя сохранить пустой OAuth access token',
+      );
+    }
     try {
       await _store.write(_oauthKey(id, 'access'), tokens.accessToken);
       await _store.write(
@@ -162,7 +169,8 @@ final class OrbitMailCredentialService {
   Future<OrbitOAuthTokenSet?> readOAuthTokens(String accountId) async {
     try {
       final access = await _store.read(_oauthKey(accountId, 'access'));
-      if (access == null) return null;
+      // MAIL-01B r2 fix (блокер 3): пустой access = валидного токена нет.
+      if (access == null || access.isEmpty) return null;
       final expiryRaw = await _store.read(_oauthKey(accountId, 'expiry'));
       final expiryMs = expiryRaw == null ? null : int.tryParse(expiryRaw);
       final refresh = await _store.read(_oauthKey(accountId, 'refresh'));
@@ -183,10 +191,12 @@ final class OrbitMailCredentialService {
     }
   }
 
-  /// Есть ли OAuth-набор (access присутствует).
+  /// Есть ли OAuth-набор с НЕпустым access token. Пустая строка не
+  /// считается секретом (MAIL-01B r2 fix, блокер 3).
   Future<bool> hasOAuthTokens(String accountId) async {
     try {
-      return await _store.read(_oauthKey(accountId, 'access')) != null;
+      final access = await _store.read(_oauthKey(accountId, 'access'));
+      return access != null && access.isNotEmpty;
     } on MissingPluginException {
       return false;
     } catch (_) {

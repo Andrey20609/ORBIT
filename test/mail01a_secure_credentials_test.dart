@@ -593,6 +593,12 @@ void main() {
               onSelectActiveAccount: (_) {},
               onSaveAccount: saveCallback,
               onRemoveAccount: (_) async => null,
+              onOAuthSignIn: (provider, name, email) =>
+                  appState.signInMailAccountWithOAuth(
+                    providerType: provider,
+                    accountName: name,
+                    accountEmail: email,
+                  ),
               verifier: OrbitMailConnectionVerifier(isMockMode: true),
             ),
           ),
@@ -641,17 +647,21 @@ void main() {
       // Статус «Сохранено, не проверено» на карточке.
       expect(find.text('Сохранено, не проверено'), findsOneWidget);
 
-      // OAuth (Gmail) — не имитируется: нет поля пароля, есть честная
-      // записка, save недоступен.
+      // MAIL-01B: OAuth (Gmail) — настоящее поле пароля отсутствует;
+      // вход через кнопку OAuth; без зарегистрированного client ID —
+      // честный CONFIG_REQUIRED и browser не открывается.
       await tester.tap(find.byKey(const Key('toggle-add-mail-account-btn')));
       await tester.pumpAndSettle();
       await tester.tap(find.byKey(const Key('mail-provider-chip-gmail')));
       await tester.pumpAndSettle();
       expect(find.byKey(const Key('mail-account-password-input')),
           findsNothing);
-      expect(find.byKey(const Key('mail-oauth-disabled-note')), findsOneWidget);
-      // Кнопка сохранения честно сообщает про отдельный OAuth-этап.
-      expect(find.textContaining('OAuth'), findsWidgets);
+      expect(find.byKey(const Key('mail-oauth-signin-btn')), findsOneWidget);
+      await tester.tap(find.byKey(const Key('mail-oauth-signin-btn')));
+      await tester.pumpAndSettle();
+      expect(find.textContaining('CONFIG_REQUIRED'), findsOneWidget,
+          reason: 'без client ID — честный CONFIG_REQUIRED, browser не '
+              'открывается');
     });
 
     test('[C11] existing accounts: legacy JSON без новых полей -> '

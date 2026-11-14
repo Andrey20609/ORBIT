@@ -549,7 +549,10 @@ final class OrbitAppState extends ChangeNotifier {
         'Не удалось сохранить аккаунт',
       );
     }
-    return OrbitMailOAuthUiOutcome.success(account);
+    // Возвращаем сохранённый effective-аккаунт (savedUnverified), а не
+    // исходный without-credential-статус.
+    final saved = _mailAccounts.firstWhere((a) => a.id == account.id);
+    return OrbitMailOAuthUiOutcome.success(saved);
   }
 
   /// MAIL-01B: действующий access token аккаунта (для будущего mail

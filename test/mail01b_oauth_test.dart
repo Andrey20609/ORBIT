@@ -1,6 +1,8 @@
 import 'dart:convert';
 
 import 'package:flutter/material.dart';
+// ignore: depend_on_referenced_packages
+import 'package:flutter_appauth_platform_interface/flutter_appauth_platform_interface.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:orbit_visual_lab/data/database/drift_orbit_database.dart';
 import 'package:orbit_visual_lab/data/database/orbit_database.dart';
@@ -40,6 +42,9 @@ final class _MockOAuthClient implements OrbitOAuthClient {
 
   /// authorize: success | cancelled | invalidGrant | transient
   String authorizeOutcome = 'success';
+
+  /// MAIL-01B r2: имитация ответа AppAuth с пустым access token.
+  bool emptyAccessToken = false;
   /// refresh: success | cancelled | invalidGrant | transient | rotation | noRotation
   String refreshOutcome = 'success';
   DateTime refreshExpiry = DateTime.now().toUtc().add(const Duration(hours: 1));
@@ -66,8 +71,8 @@ final class _MockOAuthClient implements OrbitOAuthClient {
         throw const OrbitOAuthTransientException();
       default:
         return OrbitOAuthTokenSet(
-          accessToken: _tokenCanaryA,
-          refreshToken: _tokenCanaryB,
+          accessToken: emptyAccessToken ? '' : _tokenCanaryA,
+          refreshToken: emptyAccessToken ? '' : _tokenCanaryB,
           expiryUtc: DateTime.now().toUtc().add(const Duration(hours: 1)),
           tokenType: 'Bearer',
         );
@@ -575,6 +580,131 @@ void main() {
           findsOneWidget);
     });
 
+    test('[O15] production AppAuthOAuthClient: Google получает '
+        'access_type=offline, Outlook — нет; refresh токен передаётся',
+        () async {
+      final capturedPlatform = _CapturingAppAuthPlatform();
+      final previousPlatform = FlutterAppAuthPlatform.instance;
+      FlutterAppAuthPlatform.instance = capturedPlatform;
+      addTearDown(() => FlutterAppAuthPlatform.instance = previousPlatform);
+
+      const client = AppAuthOAuthClient();
+
+      // Google: access_type=offline обязателен.
+      await client.authorize(
+        issuer: 'https://accounts.google.com',
+        clientId: 'prod-google-id',
+        scopes: const ['openid', 'email', 'https://mail.google.com/'],
+        redirectUri: 'app.orbit.orbit_visual_lab:/oauthredirect',
+      );
+      final googleRequest = capturedPlatform.lastAuthRequest!;
+      expect(googleRequest.clientId, 'prod-google-id');
+      expect(googleRequest.issuer, 'https://accounts.google.com');
+      expect(googleRequest.redirectUrl,
+          'app.orbit.orbit_visual_lab:/oauthredirect');
+      expect(googleRequest.additionalParameters?['access_type'], 'offline');
+
+      // Outlook: offline_access через scope, access_type не добавляется.
+      await client.authorize(
+        issuer: 'https://login.microsoftonline.com/testtenant/v2.0',
+        clientId: 'prod-outlook-id',
+        scopes: const ['openid', 'email', 'offline_access'],
+        redirectUri: 'app.orbit.orbit_visual_lab:/oauthredirect',
+      );
+      final outlookRequest = capturedPlatform.lastAuthRequest!;
+      expect(outlookRequest.issuer,
+          'https://login.microsoftonline.com/testtenant/v2.0');
+      expect(outlookRequest.additionalParameters?['access_type'], isNull);
+      expect(outlookRequest.scopes, contains('offline_access'));
+
+      // Refresh: refresh token передаётся в TokenRequest (grant type
+      // выводится AppAuth).
+      await client.refresh(
+        issuer: 'https://accounts.google.com',
+        clientId: 'prod-google-id',
+        scopes: const ['openid', 'email'],
+        redirectUri: 'app.orbit.orbit_visual_lab:/oauthredirect',
+        refreshToken: _tokenCanaryB,
+      );
+      expect(capturedPlatform.lastTokenRequest!.refreshToken, _tokenCanaryB);
+    });
+
+    testWidgets('[O16] null/empty access token: аккаунт/секрет/metadata '
+        'не создаются, ошибка sanitized', (tester) async {
+      tester.view.physicalSize = const Size(1080, 2400);
+      tester.view.devicePixelRatio = 1.0;
+      addTearDown(tester.view.reset);
+      final store = MemoryOrbitSecretStore();
+
+      // (a) Пустой access token из client: saveOAuthTokens отклоняет.
+      final service = OrbitMailCredentialService(store: store);
+      Object? saveError;
+      try {
+        await service.saveOAuthTokens(
+          accountId: 'acc_empty',
+          tokens: OrbitOAuthTokenSet(
+            accessToken: '',
+            refreshToken: 'r',
+            expiryUtc: DateTime.now().toUtc(),
+          ),
+        );
+      } catch (e) {
+        saveError = e;
+      }
+      expect(saveError, isA<OrbitMailCredentialException>());
+      expect('$saveError'.contains('пустой'), isTrue);
+      // Пустая строка не считается секретом.
+      expect(await service.hasOAuthTokens('acc_empty'), isFalse);
+      expect(await service.readOAuthTokens('acc_empty'), isNull);
+
+      // (b) State-level: sign-in с пустым access — error outcome,
+      // аккаунт/токены не создаются.
+      final client = _MockOAuthClient()..emptyAccessToken = true;
+      final appState = OrbitAppState(
+        MemoryLocalStateRepository(),
+        store,
+        client,
+        _oauthCfg,
+      );
+      await appState.load();
+      final outcome = await appState.signInMailAccountWithOAuth(
+        providerType: OrbitMailProviderType.gmail,
+        accountName: 'E',
+        accountEmail: 'empty@test.local',
+      );
+      expect(outcome.status, OrbitMailOAuthUiStatus.error);
+      expect(outcome.message, isNotNull);
+      expect(appState.mailAccounts.where((a) => a.email == 'empty@test.local'),
+          isEmpty, reason: 'аккаунт не создаётся без валидного токена');
+      expect(await store.read('mail.v1.acc_oauth.oauth.access'), isNull);
+    });
+
+    test('[O17] production client: null access в ответе AppAuth -> '
+        'sanitized transient, ничего не сохраняется', () async {
+      final capturedPlatform = _CapturingAppAuthPlatform()
+        ..nextAccessToken = null;
+      final previousPlatform = FlutterAppAuthPlatform.instance;
+      FlutterAppAuthPlatform.instance = capturedPlatform;
+      addTearDown(() => FlutterAppAuthPlatform.instance = previousPlatform);
+
+      const client = AppAuthOAuthClient();
+      Object? caught;
+      try {
+        await client.authorize(
+          issuer: 'https://accounts.google.com',
+          clientId: 'c',
+          scopes: const ['openid'],
+          redirectUri: 'app.orbit.orbit_visual_lab:/oauthredirect',
+        );
+      } catch (e) {
+        caught = e;
+      }
+      expect(caught, isA<OrbitOAuthTransientException>(),
+          reason: 'null access — неуспешный ответ, sanitized transient');
+      expect('$caught'.contains('token'), isFalse,
+          reason: 'сообщение не содержит значений токенов');
+    });
+
     test('[O14] no real mail: OAuth flow не вызывает IMAP/SMTP или '
         'MailService', () async {
       final client = _MockOAuthClient();
@@ -602,6 +732,58 @@ void main() {
 }
 
 /// Подсчитывающая обёртка верификатора (из MAIL-01A тестов).
+/// Capturing platform for testing the PRODUCTION AppAuthOAuthClient:
+/// records actual AuthorizationTokenRequest/TokenRequest parameters.
+class _CapturingAppAuthPlatform extends FlutterAppAuthPlatform {
+  AuthorizationTokenRequest? lastAuthRequest;
+  TokenRequest? lastTokenRequest;
+
+  // Синтетические значения генерируются в рантайме (не литералы).
+  String? nextAccessToken = DateTime.now().microsecondsSinceEpoch.toString();
+  String? nextRefreshToken = DateTime.now().microsecondsSinceEpoch.toString();
+
+  @override
+  Future<AuthorizationTokenResponse> authorizeAndExchangeCode(
+    AuthorizationTokenRequest request,
+  ) async {
+    lastAuthRequest = request;
+    return AuthorizationTokenResponse(
+      nextAccessToken,
+      nextRefreshToken,
+      DateTime.now().toUtc().add(const Duration(hours: 1)),
+      null,
+      'Bearer',
+      null,
+      null,
+      null,
+    );
+  }
+
+  @override
+  Future<TokenResponse> token(TokenRequest request) async {
+    lastTokenRequest = request;
+    return TokenResponse(
+      nextAccessToken,
+      nextRefreshToken,
+      DateTime.now().toUtc().add(const Duration(hours: 1)),
+      null,
+      'Bearer',
+      null,
+      null,
+    );
+  }
+
+  @override
+  Future<AuthorizationResponse> authorize(AuthorizationRequest request) async {
+    throw UnimplementedError();
+  }
+
+  @override
+  Future<EndSessionResponse> endSession(EndSessionRequest request) async {
+    throw UnimplementedError();
+  }
+}
+
 class _CountingVerifier implements OrbitMailConnectionVerifier {
   _CountingVerifier() : inner = OrbitMailConnectionVerifier();
 

@@ -171,11 +171,17 @@ final class AppAuthOAuthClient implements OrbitOAuthClient {
 
   static const FlutterAppAuth _appAuth = FlutterAppAuth();
 
+  /// MAIL-01B r2 fix (блокер 3): null/пустой access token — неуспешный
+  /// ответ: ничего не сохраняется, sanitized transient-ошибка.
   OrbitOAuthTokenSet _mapAuthorizationTokenResponse(
     AuthorizationTokenResponse response,
   ) {
+    final access = response.accessToken;
+    if (access == null || access.isEmpty) {
+      throw const OrbitOAuthTransientException();
+    }
     return OrbitOAuthTokenSet(
-      accessToken: response.accessToken ?? '',
+      accessToken: access,
       refreshToken: response.refreshToken,
       expiryUtc:
           response.accessTokenExpirationDateTime ?? DateTime.now().toUtc(),
@@ -183,9 +189,15 @@ final class AppAuthOAuthClient implements OrbitOAuthClient {
     );
   }
 
+  /// MAIL-01B r2 fix (блокер 3): null/пустой access token — неуспешный
+  /// ответ: прежний набор не перезаписывается, sanitized transient-ошибка.
   OrbitOAuthTokenSet _mapTokenResponse(TokenResponse response) {
+    final access = response.accessToken;
+    if (access == null || access.isEmpty) {
+      throw const OrbitOAuthTransientException();
+    }
     return OrbitOAuthTokenSet(
-      accessToken: response.accessToken ?? '',
+      accessToken: access,
       refreshToken: response.refreshToken,
       expiryUtc:
           response.accessTokenExpirationDateTime ?? DateTime.now().toUtc(),
@@ -226,12 +238,20 @@ final class AppAuthOAuthClient implements OrbitOAuthClient {
     required String redirectUri,
   }) async {
     try {
+      // MAIL-01B r2 fix (блокер 2): Google выдаёт refresh token только при
+      // access_type=offline в authorization request. Outlook получает
+      // offline_access через scope и дополнительный параметр не требует.
+      final additionalParameters =
+          issuer == 'https://accounts.google.com'
+              ? const <String, String>{'access_type': 'offline'}
+              : null;
       final response = await _appAuth.authorizeAndExchangeCode(
         AuthorizationTokenRequest(
           clientId,
           redirectUri,
           scopes: scopes,
           issuer: issuer,
+          additionalParameters: additionalParameters,
         ),
       );
       return _mapAuthorizationTokenResponse(response);
