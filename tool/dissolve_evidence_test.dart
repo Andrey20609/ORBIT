@@ -156,7 +156,9 @@ void main() {
         reason: 'set ORBIT_EVIDENCE_OUT_DIR=<abs dir> for this tool');
     Directory(outDir!).createSync(recursive: true);
 
-    // Production decode path against the actual orbit_splash_mark.png.
+    // Production decode path against the actual orbit_splash_mark.png
+    // (deliberate production-path use from the review-evidence tool).
+    // ignore: invalid_use_of_visible_for_testing_member
     final artwork = await tester.runAsync(() => decodeBrandingArtworkAsset());
     expect(artwork, isNotNull);
 
@@ -164,6 +166,8 @@ void main() {
       double? frozen,
       Key key,
     ) async {
+      // Deliberate production-hook use from the review-evidence tool.
+      // ignore: invalid_use_of_visible_for_testing_member
       OrbitStartupDissolveOverlay.debugFrozenProgress = frozen;
       final repository = _DeferredAppearanceRepository();
       final style = OrbitStyleManager(repository);
@@ -231,6 +235,8 @@ void main() {
     await save('step6_dissolve_70.png', frame70);
 
     // 100% — real completed run: overlay removed, only Today remains.
+    // Deliberate production-hook use from the review-evidence tool.
+    // ignore: invalid_use_of_visible_for_testing_member
     OrbitStartupDissolveOverlay.debugFrozenProgress = null;
     final repository = _DeferredAppearanceRepository();
     final style = OrbitStyleManager(repository);
@@ -278,6 +284,8 @@ void main() {
         reason: '70%: no white flash over Today');
     await save('step6_dissolve_100.png', frame100);
 
+    // Deliberate production-hook use from the review-evidence tool.
+    // ignore: invalid_use_of_visible_for_testing_member
     OrbitStartupDissolveOverlay.debugFrozenProgress = null;
   });
 }
