@@ -48,3 +48,8 @@ app.*.map.json
 # Widget Preview related
 .widget_preview/
 .mimosa/
+
+# ZCode plugin service files
+.mimosa/
+.v2c/
+.dart_tool/
