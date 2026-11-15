@@ -514,8 +514,8 @@ void main() {
       );
     });
 
-    test('[S10] retry limit: после исчерпания - failed финально',
-        () async {
+    test('[S10] retry limit: после исчерпания - failed финально и не '
+        'берётся в отправку', () async {
       final tempDir = await Directory.systemTemp.createTemp('mail02b_s10');
       addTearDown(() async {
         try {
@@ -531,11 +531,15 @@ void main() {
       final store = MemoryOrbitSecretStore();
       final state = await readyState(repo, store);
 
-      final socket = _fakeSmtp(
-        _sessionLines(dataResponse: '451 4.3.0 Temporary problem'),
-      );
+      // Каждый flush - свежий сокет с 4xx на DATA (transient).
+      _FakeSmtpSocket makeFailingSocket() => _fakeSmtp(
+            _sessionLines(dataResponse: '451 4.3.0 Temporary problem'),
+          );
+      var socket = makeFailingSocket();
       state.debugSmtpTransportForTest(transportFor(state, socket));
+      final outbox = SmtpOutboxStore(await repo.outboxDatabase());
 
+      // Попытка 1 (enqueue + flush): queued, retryCount 1.
       final outcome = await state.sendRealEmail(
         to: _allowedRecipient,
         subject: 'Limit-тест',
@@ -549,13 +553,190 @@ void main() {
             'реальный статус: ${outcome.status}',
       );
       expect(outcome.status, 'queued');
-      expect(outcome.status, 'queued');
+      var records = await outbox.all();
+      expect(records.single.status, outboxStatusQueued);
+      expect(records.single.retryCount, 1);
+
+      // Попытки 2 и 3: retryCount 2 и 3, всё ещё queued.
+      for (var expectedRetry = 2; expectedRetry <= 3; expectedRetry++) {
+        socket = makeFailingSocket();
+        state.debugSmtpTransportForTest(transportFor(state, socket));
+        await state.flushSmtpOutbox();
+        records = await outbox.all();
+        expect(records.single.status, outboxStatusQueued,
+            reason: 'retry $expectedRetry');
+        expect(records.single.retryCount, expectedRetry,
+            reason: 'retry $expectedRetry');
+      }
+
+      // Попытка 4: лимит (smtpMaxRetries = 3) исчерпан -> failed
+      // финально; retryCount не растёт дальше лимита.
+      socket = makeFailingSocket();
+      state.debugSmtpTransportForTest(transportFor(state, socket));
+      await state.flushSmtpOutbox();
+      records = await outbox.all();
+      expect(records.single.status, outboxStatusFailed);
+      // retryCount = фактически выполненные попытки отправки
+      // (1 начальная + 3 retry).
+      expect(records.single.retryCount, 4);
+      // Сообщение sanitized: причина классифицирована, сырой ответ
+      // сервера (451) в него не попадает.
+      expect(
+        records.single.lastError,
+        'Ошибка соединения с SMTP-сервером',
+      );
+      // Итоговый outcome при отправке такого же письма - duplicate
+      // (запись failed существует): повторной отправки не будет.
+      final again = await state.sendRealEmail(
+        to: _allowedRecipient,
+        subject: 'Limit-тест',
+        body: 'Тело',
+      );
+      expect(again.status, 'duplicate');
+      // Запись осталась единственной и failed.
+      records = await outbox.all();
+      expect(records.length, 1);
+      expect(records.single.status, outboxStatusFailed);
+    });
+
+    test('[S11] auth rejection (535): failed + персистентно notConfigured '
+        '+ сокет закрыт', () async {
+      final tempDir = await Directory.systemTemp.createTemp('mail02b_s11');
+      addTearDown(() async {
+        try {
+          await tempDir.delete(recursive: true);
+        } catch (_) {}
+      });
+      final dbFile = File(
+        '${tempDir.path}${Platform.pathSeparator}s11.sqlite',
+      );
+      final repo = DriftLocalStateRepository(
+        database: DriftOrbitDatabase(file: dbFile),
+      );
+      // Секрет в store, который переживает «перезапуск».
+      final sharedStore = MemoryOrbitSecretStore();
+      final state = await readyState(repo, sharedStore);
+
+      final socket = _fakeSmtp([
+        '220 smtp.test.local ESMTP ready',
+        '250-smtp.test.local Hello orbit',
+        '250 AUTH LOGIN PLAIN XOAUTH2',
+        '334 VXNlcm5hbWU6',
+        '334 UGFzc3dvcmQ6',
+        '535 5.7.8 Authentication credentials rejected',
+      ]);
+      state.debugSmtpTransportForTest(transportFor(state, socket));
+
+      final outcome = await state.sendRealEmail(
+        to: _allowedRecipient,
+        subject: 'Auth fail',
+        body: 'Тело',
+      );
+      expect(outcome.status, 'failed');
+      // Сокет закрыт клиентом после отказа аутентификации.
       expect(socket.destroyed, isTrue);
+      // До RCPT/DATA не дошло.
+      expect(
+        socket.written.where((l) => l.startsWith('RCPT')).length,
+        0,
+      );
+      expect(
+        socket.written.where((l) => l == 'DATA').length,
+        0,
+      );
+      // Запись failed, retryCount 1, БЕЗ повторной постановки в очередь.
+      final records = await SmtpOutboxStore(
+        await repo.outboxDatabase(),
+      ).all();
+      expect(records.single.status, outboxStatusFailed);
+      expect(records.single.retryCount, 1);
+      // Консистентно с MAIL-02A: персистентно notConfigured + authMethod
+      // очищен (проверка в snapshot после перечитывания).
+      final account = state.mailAccounts
+          .firstWhere((a) => a.id == 'acc_smtp');
+      expect(
+        account.credentialStatus,
+        OrbitMailCredentialStatus.notConfigured,
+      );
+      expect(account.authMethod, isNull);
+      final snapshot = await repo.load();
+      final accountsJson = snapshot['mailAccounts'] as List<dynamic>;
+      final entry = accountsJson
+          .whereType<Map<String, Object?>>()
+          .firstWhere((map) => map['id'] == 'acc_smtp');
+      expect(entry['credentialStatus'], 'notConfigured');
+      expect(entry.containsKey('authMethod'), isFalse);
+      // Повторный flush не берёт failed-запись и не роняет состояние.
+      await state.flushSmtpOutbox();
+      final after = await SmtpOutboxStore(
+        await repo.outboxDatabase(),
+      ).all();
+      expect(after.single.status, outboxStatusFailed);
+    });
+
+    test('[S12] network drop: сокет закрыт, запись queued для retry',
+        () async {
+      final tempDir = await Directory.systemTemp.createTemp('mail02b_s12');
+      addTearDown(() async {
+        try {
+          await tempDir.delete(recursive: true);
+        } catch (_) {}
+      });
+      final dbFile = File(
+        '${tempDir.path}${Platform.pathSeparator}s12.sqlite',
+      );
+      final repo = DriftLocalStateRepository(
+        database: DriftOrbitDatabase(file: dbFile),
+      );
+      final sharedStore = MemoryOrbitSecretStore();
+      final state = await readyState(repo, sharedStore);
+
+      // Сервер рвёт соединение после третьей записи (EHLO, AUTH, ...).
+      final socket = _fakeSmtp(_sessionLines())..closeAfterWrites = 3;
+      state.debugSmtpTransportForTest(transportFor(state, socket));
+
+      final outcome = await state.sendRealEmail(
+        to: _allowedRecipient,
+        subject: 'Network drop',
+        body: 'Тело',
+      );
+      expect(outcome.status, 'queued');
+      // Сокет закрыт транспортом при сетевом сбое.
+      expect(socket.destroyed, isTrue);
+      // До DATA не дошло (обрыв раньше).
+      expect(
+        socket.written.where((l) => l == 'DATA').length,
+        0,
+      );
+      // Запись осталась queued для retry; секрет жив.
       final records = await SmtpOutboxStore(
         await repo.outboxDatabase(),
       ).all();
       expect(records.single.status, outboxStatusQueued);
       expect(records.single.retryCount, 1);
+      final account = state.mailAccounts
+          .firstWhere((a) => a.id == 'acc_smtp');
+      expect(
+        account.credentialStatus,
+        OrbitMailCredentialStatus.savedUnverified,
+      );
+      expect(
+        await state.mailCredentialService.hasAppPassword('acc_smtp'),
+        isTrue,
+      );
+      // Повторная доставка тем же письмом: принимающая попытка ровно одна.
+      final goodSocket = _fakeSmtp(_sessionLines());
+      state.debugSmtpTransportForTest(transportFor(state, goodSocket));
+      final sent = await state.flushSmtpOutbox();
+      expect(sent, 1);
+      final delivered = await SmtpOutboxStore(
+        await repo.outboxDatabase(),
+      ).all();
+      expect(delivered.single.status, outboxStatusSent);
+      expect(
+        goodSocket.written.where((l) => l == 'DATA').length,
+        1,
+      );
     });
 
     test('[S13] leftover in-flight (crash во время отправки): restart НЕ '

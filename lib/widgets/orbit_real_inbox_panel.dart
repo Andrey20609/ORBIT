@@ -358,134 +358,142 @@ Future<void> showSmtpSendSheet(
   OrbitMailAccount account,
 ) async {
   final allowed = state.smtpSendConfig.allowedRecipients;
-  await showModalBottomSheet<void>(
-    context: context,
-    isScrollControlled: true,
-    builder: (sheetContext) {
-      var to = allowed.isEmpty ? '' : allowed.first;
-      var subject = '';
-      var body = '';
-      var busy = false;
-      String? resultText;
-      return StatefulBuilder(
-        builder: (sheetContext, setSheetState) {
-          Future<void> submit() async {
-            setSheetState(() {
-              busy = true;
-              resultText = null;
-            });
-            final outcome = await state.sendRealEmail(
-              to: to,
-              subject: subject,
-              body: body,
-            );
-            await state.refreshSmtpOutboxEntries();
-            setSheetState(() {
-              busy = false;
-              resultText = '${outcome.status}: ${outcome.message}';
-            });
-          }
+  // MAIL-02B r2 (блокер 3): контроллеры создаются ОДИН раз до листа и
+  // освобождаются после его закрытия - никаких пересозданий на ребилдах
+  // StatefulBuilder и никаких утечек.
+  final toController = TextEditingController(
+    text: allowed.isEmpty ? '' : allowed.first,
+  );
+  final subjectController = TextEditingController();
+  final bodyController = TextEditingController();
+  try {
+    await showModalBottomSheet<void>(
+      context: context,
+      isScrollControlled: true,
+      builder: (sheetContext) {
+        var busy = false;
+        String? resultText;
+        return StatefulBuilder(
+          builder: (sheetContext, setSheetState) {
+            Future<void> submit() async {
+              setSheetState(() {
+                busy = true;
+                resultText = null;
+              });
+              final outcome = await state.sendRealEmail(
+                to: toController.text,
+                subject: subjectController.text,
+                body: bodyController.text,
+              );
+              await state.refreshSmtpOutboxEntries();
+              setSheetState(() {
+                busy = false;
+                resultText = '${outcome.status}: ${outcome.message}';
+              });
+            }
 
-          return Padding(
-            padding: EdgeInsets.only(
-              left: 16,
-              right: 16,
-              top: 16,
-              bottom: MediaQuery.of(sheetContext).viewInsets.bottom + 16,
-            ),
-            child: Column(
-              mainAxisSize: MainAxisSize.min,
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Row(
-                  children: [
-                    Icon(
-                      Icons.forward_to_inbox_rounded,
-                      size: 18,
-                      color: Theme.of(sheetContext).colorScheme.primary,
-                    ),
-                    const SizedBox(width: 8),
-                    const Expanded(
-                      child: Text(
-                        'SMTP: контрольная отправка',
-                        style: TextStyle(fontWeight: FontWeight.w700),
+            return Padding(
+              padding: EdgeInsets.only(
+                left: 16,
+                right: 16,
+                top: 16,
+                bottom: MediaQuery.of(sheetContext).viewInsets.bottom + 16,
+              ),
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Row(
+                    children: [
+                      Icon(
+                        Icons.forward_to_inbox_rounded,
+                        size: 18,
+                        color: Theme.of(sheetContext).colorScheme.primary,
                       ),
-                    ),
-                  ],
-                ),
-                const SizedBox(height: 4),
-                Text(
-                  allowed.isEmpty
-                      ? 'Получатель не настроен: задайте тестовый адрес '
-                          'получателя в конфигурации сборки.'
-                      : 'Разрешённый получатель: ${allowed.join(', ')}',
-                  style: const TextStyle(fontSize: 12),
-                ),
-                const SizedBox(height: 10),
-                TextField(
-                  key: const Key('smtp-sheet-to'),
-                  controller: TextEditingController(text: to),
-                  enabled: allowed.length != 1,
-                  decoration: const InputDecoration(
-                    labelText: 'Кому (разрешённый получатель)',
-                    border: OutlineInputBorder(),
+                      const SizedBox(width: 8),
+                      const Expanded(
+                        child: Text(
+                          'SMTP: контрольная отправка',
+                          style: TextStyle(fontWeight: FontWeight.w700),
+                        ),
+                      ),
+                    ],
                   ),
-                  onChanged: (value) => to = value,
-                ),
-                const SizedBox(height: 8),
-                TextField(
-                  key: const Key('smtp-sheet-subject'),
-                  controller: TextEditingController(text: subject),
-                  decoration: const InputDecoration(
-                    labelText: 'Тема',
-                    border: OutlineInputBorder(),
-                  ),
-                  onChanged: (value) => subject = value,
-                ),
-                const SizedBox(height: 8),
-                TextField(
-                  key: const Key('smtp-sheet-body'),
-                  controller: TextEditingController(text: body),
-                  maxLines: 4,
-                  decoration: const InputDecoration(
-                    labelText: 'Текст письма',
-                    border: OutlineInputBorder(),
-                  ),
-                  onChanged: (value) => body = value,
-                ),
-                const SizedBox(height: 10),
-                FilledButton.icon(
-                  key: const Key('smtp-sheet-submit'),
-                  onPressed: busy || allowed.isEmpty ? null : submit,
-                  icon: busy
-                      ? const SizedBox(
-                          width: 14,
-                          height: 14,
-                          child: CircularProgressIndicator(strokeWidth: 2),
-                        )
-                      : const Icon(Icons.send_rounded, size: 16),
-                  label: const Text('Поставить в очередь и отправить'),
-                ),
-                if (resultText != null) ...[
-                  const SizedBox(height: 8),
+                  const SizedBox(height: 4),
                   Text(
-                    key: const Key('smtp-sheet-result'),
-                    resultText!,
+                    allowed.isEmpty
+                        ? 'Получатель не настроен: задайте тестовый адрес '
+                            'получателя в конфигурации сборки.'
+                        : 'Разрешённый получатель: ${allowed.join(', ')}',
                     style: const TextStyle(fontSize: 12),
                   ),
+                  const SizedBox(height: 10),
+                  TextField(
+                    key: const Key('smtp-sheet-to'),
+                    controller: toController,
+                    enabled: allowed.length != 1,
+                    decoration: const InputDecoration(
+                      labelText: 'Кому (разрешённый получатель)',
+                      border: OutlineInputBorder(),
+                    ),
+                  ),
+                  const SizedBox(height: 8),
+                  TextField(
+                    key: const Key('smtp-sheet-subject'),
+                    controller: subjectController,
+                    decoration: const InputDecoration(
+                      labelText: 'Тема',
+                      border: OutlineInputBorder(),
+                    ),
+                  ),
+                  const SizedBox(height: 8),
+                  TextField(
+                    key: const Key('smtp-sheet-body'),
+                    controller: bodyController,
+                    maxLines: 4,
+                    decoration: const InputDecoration(
+                      labelText: 'Текст письма',
+                      border: OutlineInputBorder(),
+                    ),
+                  ),
+                  const SizedBox(height: 10),
+                  FilledButton.icon(
+                    key: const Key('smtp-sheet-submit'),
+                    onPressed: busy || allowed.isEmpty ? null : submit,
+                    icon: busy
+                        ? const SizedBox(
+                            width: 14,
+                            height: 14,
+                            child: CircularProgressIndicator(strokeWidth: 2),
+                          )
+                        : const Icon(Icons.send_rounded, size: 16),
+                    label: const Text('Поставить в очередь и отправить'),
+                  ),
+                  if (resultText != null) ...[
+                    const SizedBox(height: 8),
+                    Text(
+                      key: const Key('smtp-sheet-result'),
+                      resultText!,
+                      style: const TextStyle(fontSize: 12),
+                    ),
+                  ],
+                  const SizedBox(height: 8),
+                  const Text(
+                    'Письмо попадает в персистентную очередь: retry при '
+                    'сетевых сбоях, без дубликатов; содержимое и статус — '
+                    'только в локальной базе устройства.',
+                    style: TextStyle(fontSize: 11),
+                  ),
                 ],
-                const SizedBox(height: 8),
-                const Text(
-                  'Письмо попадает в персистентную очередь: retry при '
-                  'сетевых сбоях, без дубликатов; содержимое и статус — '
-                  'только в локальной базе устройства.',
-                  style: TextStyle(fontSize: 11),
-                ),
-              ],
-            ),
-          );
-        },
-      );
-    },
-  );
+              ),
+            );
+          },
+        );
+      },
+    );
+  } finally {
+    toController.dispose();
+    subjectController.dispose();
+    bodyController.dispose();
+  }
 }

@@ -831,7 +831,7 @@ final class OrbitAppState extends ChangeNotifier {
 
   SmtpSendConfig _smtpSendConfig = SmtpSendConfig.fromEnvironment();
   SmtpMailTransport? _smtpTransportOverride;
-  bool _smtpFlushInProgress = false;
+  Future<void> _smtpFlushJob = Future<void>.value();
   final List<SmtpOutboxRecord> _smtpOutboxEntries = <SmtpOutboxRecord>[];
 
   /// MAIL-02B: test hook — подмена конфигурации разрешённых получателей
@@ -946,6 +946,11 @@ final class OrbitAppState extends ChangeNotifier {
 
   /// Flush персистентного outbox (retry после restart при сетевых сбоях).
   ///
+  /// Сериализация: параллельные вызовы (например, sendRealEmail во время
+  /// активного фонового flush) выстраиваются в цепочку — второй вызов
+  /// НЕ пропускается, а выполняет собственный проход после завершения
+  /// предыдущего (mail02b r2 fix, блокер 2).
+  ///
   /// Идемпотентность (ТЗ):
   /// - leftover `sending` (crash/restart во время полёта) переводится в
   ///   failed БЕЗ повторной отправки — письмо могло быть принято
@@ -955,12 +960,30 @@ final class OrbitAppState extends ChangeNotifier {
   /// Retry: transient-ошибки -> queued (retry_count+1, максимум
   /// [smtpMaxRetries]); auth/constant -> failed. Секреты/заголовки
   /// авторизации в ошибках и логах отсутствуют (sanitized).
-  Future<int> flushSmtpOutbox() async {
+  Future<int> flushSmtpOutbox() {
+    final job = _smtpFlushJob.then(
+      (_) => _flushSmtpOutboxInternal(),
+    );
+    // Цепочка живёт даже при ошибке отдельного прохода.
+    _smtpFlushJob = job.then(
+      (_) {},
+      onError: (Object _) {},
+    );
+    return job;
+  }
+
+  Future<int> _flushSmtpOutboxInternal() async {
     final repository = _repository;
     if (repository is! DriftLocalStateRepository) return 0;
-    if (_smtpFlushInProgress) return 0; // без параллельных flush
-    _smtpFlushInProgress = true;
-    try {
+    // while-рескан: письма, поставленные в очередь ВО ВРЕМЯ активного
+    // flush, гарантированно обрабатываются этим же проходом; завершение
+    // — когда очередь пуста (retry-возвраты ограничены smtpMaxRetries).
+    var sentTotal = 0;
+    // Записи, обработанные этим проходом: retry-возвраты НЕ долбятся
+    // повторно в том же flush (retry - следующий flush/restart), но
+    // письма, поставленные в очередь ВО ВРЕМЯ прохода, обрабатываются.
+    final processedIds = <String>{};
+    while (true) {
       final store = SmtpOutboxStore(await repository.outboxDatabase());
       // Leftover in-flight с прошлого процесса: НЕ переотправлять.
       final inFlight = await store.byStatus(outboxStatusSending);
@@ -973,8 +996,14 @@ final class OrbitAppState extends ChangeNotifier {
               'не выполняется (защита от дубликатов)',
         );
       }
-      final pending = await store.byStatus(outboxStatusQueued);
-      if (pending.isEmpty) return 0;
+      final pending = await store
+          .byStatus(outboxStatusQueued)
+          .then(
+            (records) => records
+                .where((record) => !processedIds.contains(record.id))
+                .toList(),
+          );
+      if (pending.isEmpty) break;
       final transport =
           _smtpTransportOverride ??
           SmtpMailTransport(
@@ -987,9 +1016,8 @@ final class OrbitAppState extends ChangeNotifier {
             credentialService: _credentials,
             sendConfig: _smtpSendConfig,
           );
-      var sentCount = 0;
       for (final record in pending) {
-        if (_smtpOutboxCancelRequested) break;
+        processedIds.add(record.id);
         await store.updateStatus(record.id, outboxStatusSending);
         var accepted = false;
         SmtpTransportException? failure;
@@ -1022,7 +1050,7 @@ final class OrbitAppState extends ChangeNotifier {
             outboxStatusSent,
             sentAtMs: DateTime.now().millisecondsSinceEpoch,
           );
-          sentCount++;
+          sentTotal++;
           continue;
         }
         final transient = failure?.isTransient ?? false;
@@ -1064,15 +1092,10 @@ final class OrbitAppState extends ChangeNotifier {
           }
         }
       }
-      await refreshSmtpOutboxEntries();
-      return sentCount;
-    } finally {
-      _smtpFlushInProgress = false;
-      _smtpOutboxCancelRequested = false;
     }
+    await refreshSmtpOutboxEntries();
+    return sentTotal;
   }
-
-  bool _smtpOutboxCancelRequested = false;
 
   /// ТЗ: лимит повторов одной записи.
   static const int smtpMaxRetries = 3;
