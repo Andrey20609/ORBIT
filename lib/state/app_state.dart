@@ -1,7 +1,7 @@
 import 'dart:async';
-
 import 'package:clock/clock.dart';
 import 'package:flutter/material.dart';
+
 
 import '../core/module_interfaces.dart';
 import '../data/demo_data.dart';
@@ -12,6 +12,7 @@ import '../data/orbit_local_state_codec.dart';
 import '../data/orbit_local_state_repository.dart';
 import '../data/orbit_secure_store.dart';
 import '../services/brain/gemini_brain_engine.dart';
+import '../services/mail/imap_body_cache_store.dart';
 import '../services/mail/imap_mail_transport.dart';
 import '../services/mail/mail_connection_verifier.dart';
 import '../services/mail/mail_models.dart';
@@ -1164,6 +1165,138 @@ final class OrbitAppState extends ChangeNotifier {
     _notify();
   }
 
+  // ===== MAIL-02C: on-demand тело письма + кэш =====
+
+  final Map<String, CachedEmailBody> _bodyCacheInView =
+      <String, CachedEmailBody>{};
+  bool _bodyFetchInProgress = false;
+  String? _lastBodyFetchError;
+
+  /// Кэш тел для UI (обновляется [fetchEmailBodyFor]).
+  CachedEmailBody? cachedBodyFor(String emailId) => _bodyCacheInView[emailId];
+
+  /// MAIL-02C: test hook — кладёт запись в view-кэш (UI-тесты отображения
+  /// тела без сети и без file-SQLite в fake-async зоне).
+  @visibleForTesting
+  void debugPutCachedBodyForTest(CachedEmailBody record) {
+    _bodyCacheInView[record.id] = record;
+    _notify();
+  }
+
+  /// MAIL-02C: test hook — добавляет real-inbox entry для UI-тестов.
+  @visibleForTesting
+  void debugPutUserInboxEntryForTest(UserInboxEntry entry) {
+    _userInboxEntries.add(entry);
+    _notify();
+  }
+
+  /// Sanitized сообщение последней неудачной догрузки тела.
+  String? get lastBodyFetchError => _lastBodyFetchError;
+
+  bool get isBodyFetchInProgress => _bodyFetchInProgress;
+
+  /// MAIL-02C: тело письма on-demand. Идемпотентно:
+  /// - кэш в production SQLite (imap_body_cache) - при попадании сеть
+  ///   НЕ используется (повторный запрос после рестарта не нужен);
+  /// - промах - read-only догрузка (EXAMINE + BODY.PEEK[TEXT]<0.cap> +
+  ///   BODYSTRUCTURE) с size cap против OOM, санитизация перед кэшем;
+  /// - UIDVALIDITY сменился - кэш-запись удаляется (поколение
+  ///   недействительно) и возвращается sanitized transient-сообщение.
+  Future<CachedEmailBody?> fetchEmailBodyFor(String emailId) async {
+    _lastBodyFetchError = null;
+    final repository = _repository;
+    if (repository is! DriftLocalStateRepository) {
+      _lastBodyFetchError = 'Догрузка требует production-хранилища';
+      _notify();
+      return null;
+    }
+    final parsed = _parseDeterministicEmailId(emailId);
+    if (parsed == null) {
+      _lastBodyFetchError = 'Некорректный идентификатор письма';
+      _notify();
+      return null;
+    }
+    final cache = ImapBodyCacheStore(await repository.outboxDatabase());
+    final cached = await cache.byId(emailId);
+    if (cached != null) {
+      _bodyCacheInView[emailId] = cached;
+      _notify();
+      return cached;
+    }
+    final account = _mailAccounts
+        .where((a) => a.id == parsed.accountId)
+        .firstOrNull;
+    if (account == null || account.isDemo) {
+      _lastBodyFetchError = 'Аккаунт недоступен';
+      _notify();
+      return null;
+    }
+    _bodyFetchInProgress = true;
+    _notify();
+    try {
+      final transport =
+          _imapTransportOverride ??
+          ImapMailTransport(
+            resolveAccount: (id) async {
+              final i = _mailAccounts.indexWhere((a) => a.id == id);
+              return i == -1 ? null : _mailAccounts[i];
+            },
+            resolveAccessToken: (target) =>
+                getValidOAuthAccessToken(target.id),
+            credentialService: _credentials,
+          );
+      final body = await transport.fetchBodyByUid(
+        accountId: parsed.accountId,
+        uid: parsed.uid,
+        uidValidity: parsed.uidValidity,
+      );
+      final record = CachedEmailBody(
+        id: emailId,
+        accountId: parsed.accountId,
+        uidValidity: parsed.uidValidity,
+        uid: parsed.uid,
+        bodyText: ImapBodyCacheStore.sanitizeBodyText(body.bodyText),
+        truncated: body.truncated,
+        fullSize: body.fullSize,
+        attachments: body.attachments,
+        fetchedAtMs: DateTime.now().millisecondsSinceEpoch,
+        fromCache: false,
+      );
+      await cache.upsert(record);
+      _bodyCacheInView[emailId] = record;
+      return record;
+    } on ImapTransportException catch (error) {
+      if (error.isTransient) {
+        // Поколение папки изменилось: кэш недействителен и удаляется.
+        await cache.deleteById(emailId);
+      }
+      _lastBodyFetchError = error.message;
+      return null;
+    } catch (_) {
+      _lastBodyFetchError = 'Догрузка не выполнена';
+      return null;
+    } finally {
+      _bodyFetchInProgress = false;
+      _notify();
+    }
+  }
+
+  /// Разбор детерминированного id `accountId:folder:uidValidity:uid`.
+  /// Надёжен к двоеточиям в accountId: последние 3 сегмента - folder /
+  /// uidValidity / uid, остальное - accountId.
+  _DeterministicEmailId? _parseDeterministicEmailId(String id) {
+    final parts = id.split(':');
+    if (parts.length < 4) return null;
+    final uid = int.tryParse(parts.last);
+    final uidValidity = int.tryParse(parts[parts.length - 2]);
+    if (uid == null || uidValidity == null) return null;
+    final folder = parts[parts.length - 3];
+    if (folder.isEmpty) return null;
+    final accountId = parts.sublist(0, parts.length - 3).join(':');
+    if (accountId.isEmpty) return null;
+    return _DeterministicEmailId(accountId, folder, uidValidity, uid);
+  }
+
   /// Активный не-демо аккаунт с настроенными credential (или null).
   OrbitMailAccount? _activeNonDemoAccount() {
     for (final account in _mailAccounts) {
@@ -1704,4 +1837,20 @@ final class OrbitAppState extends ChangeNotifier {
     lastPersistenceError = null;
     await load();
   }
+}
+
+
+/// MAIL-02C: разобранный детерминированный id письма.
+final class _DeterministicEmailId {
+  const _DeterministicEmailId(
+    this.accountId,
+    this.folder,
+    this.uidValidity,
+    this.uid,
+  );
+
+  final String accountId;
+  final String folder;
+  final int uidValidity;
+  final int uid;
 }

@@ -25,6 +25,46 @@ class ImapProtocolException implements Exception {
   String toString() => 'ImapProtocolException: $message';
 }
 
+/// MAIL-02C: безопасные метаданные вложения (имя файла, размер, MIME-тип).
+/// Содержимое вложения НЕ скачивается и НЕ сохраняется по умолчанию.
+@immutable
+class ImapAttachmentMetadata {
+  const ImapAttachmentMetadata({
+    required this.fileName,
+    required this.sizeBytes,
+    required this.mimeType,
+  });
+
+  final String fileName;
+  final int sizeBytes;
+  final String mimeType;
+}
+
+/// MAIL-02C: результат on-demand догрузки тела выбранного письма.
+/// Тело получено строго через BODY.PEEK (серверное состояние не изменено);
+/// размер ограничен size cap (partial fetch <0.maxBytes>).
+@immutable
+class ImapMessageBody {
+  const ImapMessageBody({
+    required this.uid,
+    required this.bodyText,
+    required this.truncated,
+    required this.fullSize,
+    required this.attachments,
+  });
+
+  final int uid;
+
+  /// Сырое тело (обрезанное до size cap при truncation); санитизация
+  /// выполняется слоем кэша/отображения.
+  final String bodyText;
+  final bool truncated;
+
+  /// Полный размер тела в octets (RFC822.SIZE).
+  final int fullSize;
+  final List<ImapAttachmentMetadata> attachments;
+}
+
 /// Metadata одного реального письма (минимальный cache по ТЗ: sender,
 /// subject, ограниченный preview, timestamp, flags; БЕЗ тела, HTML,
 /// вложений).
@@ -325,6 +365,298 @@ final class ImapReadOnlyClient {
     return _parseFetch(result.untaggedResponses, uidValidity, previewOctets);
   }
 
+  /// MAIL-02C: on-demand догрузка тела ОДНОГО письма по UID - строго
+  /// read-only: BODY.PEEK[TEXT]<0.maxBytes> (partial fetch, флаг
+  /// '\Seen' на сервере не изменяется) + RFC822.SIZE (полный размер) +
+  /// BODYSTRUCTURE (метаданные вложений). Содержимое вложений НЕ
+  /// запрашивается. maxBytes - жесткий size cap против OOM.
+  Future<ImapMessageBody> fetchBodyByUid({
+    required int uid,
+    int maxBytes = 262144,
+  }) async {
+    final result = await _sendCommand(
+      'UID FETCH $uid (UID RFC822.SIZE BODYSTRUCTURE '
+      'BODY.PEEK[TEXT]<0.$maxBytes>)',
+    );
+    for (final pieces in result.untaggedResponses) {
+      final record = <_ImapResponsePiece>[...pieces];
+      if (!pieces.last.isLiteral && pieces.last.text.endsWith(')')) {
+        final body = _buildRecord(record, uid);
+        if (body != null) return body;
+      }
+    }
+    throw const ImapProtocolException('Тело письма не получено');
+  }
+
+  /// Сборка одной FETCH-записи: UID проверяется вне литералов, тело
+  /// извлекается из литерала BODY[TEXT]<0>, attachments - из
+  /// BODYSTRUCTURE (span-aware, ошибки парсинга -> пустой список).
+  ImapMessageBody? _buildRecord(
+    List<_ImapResponsePiece> pieces,
+    int expectedUid,
+  ) {
+    final spans = <_LiteralSpan>[];
+    final builder = StringBuffer();
+    for (final piece in pieces) {
+      if (piece.isLiteral) {
+        spans.add(_LiteralSpan(builder.length, piece.literalContent));
+        builder.write(piece.literalContent);
+      } else {
+        builder.write(piece.text);
+      }
+    }
+    final body = builder.toString();
+
+    final uidMatch = _firstMatchOutsideLiterals(
+      body,
+      spans,
+      RegExp('UID ([0-9]+)'),
+    );
+    if (uidMatch == null || int.parse(uidMatch.group(1)!) != expectedUid) {
+      return null;
+    }
+
+    var fullSize = 0;
+    final sizeMatch = _firstMatchOutsideLiterals(
+      body,
+      spans,
+      RegExp('RFC822.SIZE ([0-9]+)'),
+    );
+    if (sizeMatch != null) fullSize = int.parse(sizeMatch.group(1)!);
+
+    var bodyText = '';
+    var fetchedBytes = 0;
+    final textStart = _bodyTextLiteralStart(body, spans);
+    if (textStart != null) {
+      final textSpan = _spanAt(spans, textStart);
+      if (textSpan != null) {
+        bodyText = textSpan.content;
+        fetchedBytes = utf8.encode(bodyText).length;
+      }
+    }
+
+    final attachments = _parseAttachments(body, spans);
+
+    return ImapMessageBody(
+      uid: expectedUid,
+      bodyText: bodyText,
+      // Многобайтовые тела: сравниваем ПОЛУЧЕННЫЕ байты с полным
+      // размером (число символов меньше байтов и дало бы ложный
+      // 'truncated' на полном multibyte-письме).
+      truncated: fetchedBytes < fullSize,
+      fullSize: fullSize,
+      attachments: attachments,
+    );
+  }
+
+  /// Позиция литерала тела: сначала partial-маркер BODY[TEXT]<0>,
+  /// fallback - нормализованный BODY[TEXT] (некоторые серверы).
+  int? _bodyTextLiteralStart(String body, List<_LiteralSpan> spans) {
+    final partial = _literalContentStartAfter(body, spans, 'BODY[TEXT]<0>');
+    if (partial != null) return partial;
+    return _literalContentStartAfter(body, spans, 'BODY[TEXT]');
+  }
+
+  // ===== MAIL-02C: разбор BODYSTRUCTURE (метаданные вложений) =====
+
+  /// Токенизация s-выражения вне литерал-span'ов: списки ('('/')'),
+  /// quoted strings, атомы; содержимое литералов попадает как одна
+  /// строка (не может притвориться скобкой).
+  Object? _parseStructureValue(
+    String text,
+    List<_LiteralSpan> spans,
+    _StructCursor cursor,
+  ) {
+    cursor.skipSpaces(text);
+    if (cursor.pos >= text.length) return null;
+    if (cursor.pos >= text.length) return null;
+    final spanAt = _spanCovering(spans, cursor.pos);
+    if (spanAt != null) {
+      final value = spanAt.content;
+      cursor.pos = spanAt.start + spanAt.content.length;
+      return value;
+    }
+    final char = text[cursor.pos];
+    if (char == '(') {
+      cursor.pos++;
+      final list = <Object?>[];
+      while (cursor.pos < text.length) {
+        cursor.skipSpaces(text);
+        if (cursor.pos < text.length && text[cursor.pos] == ')') {
+          cursor.pos++;
+          return list;
+        }
+        final value = _parseStructureValue(text, spans, cursor);
+        if (value == null) return list;
+        list.add(value);
+      }
+      return list;
+    }
+    if (char == ')') {
+      return null;
+    }
+    if (char == '"') {
+      cursor.pos++;
+      final buffer = StringBuffer();
+      while (cursor.pos < text.length) {
+        final current = text[cursor.pos];
+        if (current == String.fromCharCode(92) &&
+            cursor.pos + 1 < text.length) {
+          buffer.write(text[cursor.pos + 1]);
+          cursor.pos += 2;
+          continue;
+        }
+        if (current == '"') {
+          cursor.pos++;
+          break;
+        }
+        buffer.write(current);
+        cursor.pos++;
+      }
+      return buffer.toString();
+    }
+    // Атом: до пробела/скобки/кавычки.
+    final start = cursor.pos;
+    while (cursor.pos < text.length) {
+      final current = text[cursor.pos];
+      if (current == ' ' ||
+          current == '(' ||
+          current == ')' ||
+          current == '"') {
+        break;
+      }
+      cursor.pos++;
+    }
+    return text.substring(start, cursor.pos);
+  }
+
+  _LiteralSpan? _spanCovering(List<_LiteralSpan> spans, int position) {
+    for (final span in spans) {
+      final end = span.start + span.content.length;
+      if (position >= span.start && position < end) return span;
+    }
+    return null;
+  }
+
+  /// Attachments из BODYSTRUCTURE: рекурсивный обход частей; собираются
+  /// ТОЛЬКО metadata (имя/размер/mime) частей с disposition ATTACHMENT
+  /// (или параметром NAME у не-TEXT частей). Ошибки парсинга -> пустой
+  /// список (metadata - не критичный путь).
+  List<ImapAttachmentMetadata> _parseAttachments(
+    String body,
+    List<_LiteralSpan> spans,
+  ) {
+    try {
+      final structStart = _structureStart(body, spans);
+      if (structStart == null) return const <ImapAttachmentMetadata>[];
+      final cursor = _StructCursor()..pos = structStart;
+      final node = _parseStructureValue(body, spans, cursor);
+      final out = <ImapAttachmentMetadata>[];
+      _collectAttachments(node, out);
+      return List<ImapAttachmentMetadata>.unmodifiable(out);
+    } catch (_) {
+      return const <ImapAttachmentMetadata>[];
+    }
+  }
+
+  int? _structureStart(String body, List<_LiteralSpan> spans) {
+    var searchFrom = 0;
+    while (true) {
+      final idx = body.indexOf('BODYSTRUCTURE', searchFrom);
+      if (idx == -1) return null;
+      if (!_insideAnySpan(spans, idx)) {
+        // Первая '(' после маркера - начало структуры.
+        final open = body.indexOf('(', idx);
+        if (open == -1) return null;
+        if (_spanCovering(spans, open) != null) {
+          searchFrom = idx + 'BODYSTRUCTURE'.length;
+          continue;
+        }
+        return open;
+      }
+      searchFrom = idx + 'BODYSTRUCTURE'.length;
+    }
+  }
+
+  void _collectAttachments(Object? node, List<ImapAttachmentMetadata> out) {
+    if (node is! List || node.isEmpty) return;
+    // Multipart (parts-first): первый элемент - список (дочерние части).
+    if (node.first is List) {
+      for (final child in node) {
+        if (child is List) _collectAttachments(child, out);
+      }
+      return;
+    }
+    // Multipart (mixed-first, некоторые серверы): подтип строкой,
+    // дочерние части - списки среди остальных элементов.
+    if (node.first is String &&
+        (node.first as String).toUpperCase() == 'MIXED') {
+      for (final child in node) {
+        if (child is List) _collectAttachments(child, out);
+      }
+      return;
+    }
+    // Простая часть: TYPE SUB (params) id descr enc size ...
+    final type = node[0] is String ? node[0] as String : '';
+    final sub = node.length > 1 && node[1] is String ? node[1] as String : '';
+    var fileName = '';
+    var isAttachment = false;
+    for (final item in node) {
+      if (item is! List || item.isEmpty) continue;
+      if (item.first is String &&
+          (item.first as String).toUpperCase() == 'ATTACHMENT') {
+        isAttachment = true;
+        if (item.length > 1 && item[1] is List) {
+          fileName = _paramValue(item[1] as List, 'FILENAME') ?? fileName;
+        }
+        continue;
+      }
+      final name = _paramValue(item, 'NAME');
+      if (name != null && fileName.isEmpty) fileName = name;
+      final fname = _paramValue(item, 'FILENAME');
+      if (fname != null) fileName = fname;
+    }
+    if (!isAttachment && fileName.isEmpty) return;
+    var sizeBytes = 0;
+    for (var i = 4; i < node.length; i++) {
+      final item = node[i];
+      if (item is String && _isDigits(item)) {
+        sizeBytes = int.parse(item);
+        break;
+      }
+    }
+    if (!isAttachment && type.toUpperCase() == 'TEXT') return;
+    out.add(
+      ImapAttachmentMetadata(
+        fileName: fileName,
+        sizeBytes: sizeBytes,
+        mimeType:
+            '${type.isEmpty ? 'APPLICATION' : type.toUpperCase()}'
+            '/${sub.isEmpty ? 'OCTET-STREAM' : sub.toUpperCase()}',
+      ),
+    );
+  }
+
+  String? _paramValue(List<Object?> params, String key) {
+    for (var i = 0; i + 1 < params.length; i++) {
+      final item = params[i];
+      if (item is String && item.toUpperCase() == key) {
+        final value = params[i + 1];
+        if (value is String && value.toUpperCase() != 'NIL') return value;
+        return null;
+      }
+    }
+    return null;
+  }
+
+  static bool _isDigits(String value) {
+    if (value.isEmpty) return false;
+    for (final code in value.codeUnits) {
+      if (code < 48 || code > 57) return false;
+    }
+    return true;
+  }
+
   Future<void> logout() async {
     try {
       await _sendCommand('LOGOUT');
@@ -547,5 +879,16 @@ final class ImapReadOnlyClient {
     final doubled = value.replaceAll(bs, '$bs$bs');
     final escaped = doubled.replaceAll('"', '$bs"');
     return '"$escaped"';
+  }
+}
+
+/// Курсор разбора s-выражения BODYSTRUCTURE (позиция сканирования).
+final class _StructCursor {
+  int pos = 0;
+
+  void skipSpaces(String text) {
+    while (pos < text.length && text[pos] == ' ') {
+      pos++;
+    }
   }
 }

@@ -23,15 +23,21 @@ typedef OrbitImapClientFactory =
 /// OrbitMailCredentialService.getValidAccessToken и отражена в metadata;
 /// транспорт сообщает sanitized-факт, исход трактуется как transient
 /// (savedUnverified, retry доступен).
+/// [isTransient] (MAIL-02C) - временная недоступность конкретной записи
+/// (например, UIDVALIDITY сменился между sync и догрузкой тела):
+/// retry возможен после следующего sync; не влияет на MAIL-02A state
+/// machine (по умолчанию false).
 class ImapTransportException implements Exception {
   const ImapTransportException(
     this.message, {
     this.isAuthRelated = false,
+    this.isTransient = false,
     this.cause,
   });
 
   final String message;
   final bool isAuthRelated;
+  final bool isTransient;
   final Object? cause;
 
   @override
@@ -145,6 +151,77 @@ final class ImapMailTransport implements MailTransport {
     } catch (error) {
       client?.destroy();
       throw ImapTransportException('Синхронизация не выполнена', cause: error);
+    }
+  }
+
+  /// MAIL-02C: on-demand догрузка тела одного письма - строго read-only
+  /// сессия (EXAMINE + BODY.PEEK[TEXT]<0.cap> + BODYSTRUCTURE), size cap
+  /// против OOM; содержимое вложений не запрашивается.
+  Future<ImapMessageBody> fetchBodyByUid({
+    required String accountId,
+    required int uid,
+    required int uidValidity,
+    int maxBytes = 262144,
+  }) async {
+    if (accountId.isEmpty) {
+      throw const ImapTransportException(
+        'Не указан аккаунт для догрузки тела',
+      );
+    }
+    final account = await _resolveAccount(accountId);
+    if (account == null) {
+      throw const ImapTransportException('Аккаунт не найден');
+    }
+    if (account.isDemo) {
+      throw const ImapTransportException(
+        'Демо-аккаунт не синхронизируется по IMAP',
+      );
+    }
+    ImapReadOnlyClient? client;
+    try {
+      client = await _clientFactory(account);
+      await _authenticate(client, account);
+      final serverUidValidity = await client.examineInbox();
+      // UIDVALIDITY сменился: кэш по старому поколению недействителен.
+      if (serverUidValidity != uidValidity) {
+        try {
+          await client.logout();
+        } catch (_) {}
+        throw ImapTransportException(
+          'Письмо недоступно: поколение папки изменилось',
+          isTransient: true,
+        );
+      }
+      final body = await client.fetchBodyByUid(
+        uid: uid,
+        maxBytes: maxBytes,
+      );
+      try {
+        await client.logout();
+      } catch (_) {}
+      return body;
+    } on ImapTransportException {
+      client?.destroy();
+      rethrow;
+    } on ImapAuthException {
+      client?.destroy();
+      throw const ImapTransportException(
+        'Сервер отклонил аутентификацию: проверьте учётные данные',
+        isAuthRelated: true,
+      );
+    } on ImapProtocolException catch (error) {
+      client?.destroy();
+      throw ImapTransportException('Ошибка протокола IMAP', cause: error);
+    } on ImapConnectionException catch (error) {
+      client?.destroy();
+      throw ImapTransportException(
+        'Ошибка соединения с IMAP-сервером',
+        isTransient: true,
+        cause: error,
+      );
+    } catch (error) {
+      client?.destroy();
+      throw ImapTransportException('Догрузка не выполнена', cause: error);
     }
   }
 

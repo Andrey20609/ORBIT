@@ -52,6 +52,7 @@ final class DriftOrbitDatabase implements OrbitDatabase {
       snapshotTableName,
       migrationsTableName,
       outboxTableName,
+      imapBodyCacheTableName,
     };
     if (!known.contains(table)) {
       throw ArgumentError.value(table, 'table', 'Unknown ORBIT table');
@@ -63,6 +64,17 @@ final class DriftOrbitDatabase implements OrbitDatabase {
   /// per-table column allowlist before being embedded into SQL, so dynamic
   /// or hostile input can never inject extra SQL syntax.
   static const Map<String, Set<String>> _tableColumns = {
+    imapBodyCacheTableName: {
+      'id',
+      'account_id',
+      'uid_validity',
+      'uid',
+      'body_text',
+      'truncated',
+      'full_size',
+      'attachments_json',
+      'fetched_at',
+    },
     outboxTableName: {
       'id',
       'workspace_id',
@@ -497,6 +509,27 @@ const String createSmtpOutboxTable = '''
   );
 ''';
 
+/// MAIL-02C: on-demand body cache (read-only IMAP). Additive table, same
+/// in-place upgrade pattern. The email id is the MAIL-02A deterministic
+/// id (accountId:folder:uidValidity:uid); uidvalidity is stored
+/// explicitly so stale cache rows across folder generations are
+/// detectable. Attachment PAYLOADS are never stored - only sanitized
+/// metadata JSON (fileName/sizeBytes/mimeType).
+const String imapBodyCacheTableName = 'imap_body_cache';
+const String createImapBodyCacheTable = '''
+  CREATE TABLE IF NOT EXISTS imap_body_cache (
+    id TEXT PRIMARY KEY,
+    account_id TEXT NOT NULL,
+    uid_validity INTEGER NOT NULL,
+    uid INTEGER NOT NULL,
+    body_text TEXT NOT NULL,
+    truncated INTEGER NOT NULL DEFAULT 0,
+    full_size INTEGER NOT NULL DEFAULT 0,
+    attachments_json TEXT NOT NULL DEFAULT '[]',
+    fetched_at INTEGER NOT NULL
+  );
+''';
+
 /// Thin [GeneratedDatabase] shell that owns the connection, creates the
 /// existing ORBIT SQL schema verbatim and seeds default workspaces the same
 /// way [MemoryOrbitDatabase] does.
@@ -520,6 +553,7 @@ final class _OrbitDriftCore extends GeneratedDatabase {
     await customStatement(createSnapshotTable);
     await customStatement(createMigrationsTable);
     await customStatement(createSmtpOutboxTable);
+    await customStatement(createImapBodyCacheTable);
     await _ensureEmailsSourceTypeColumn();
   }
 
@@ -544,6 +578,7 @@ final class _OrbitDriftCore extends GeneratedDatabase {
         createSnapshotTable,
         createMigrationsTable,
         createSmtpOutboxTable,
+        createImapBodyCacheTable,
         OrbitDatabaseSchema.createWorkspaces,
         OrbitDatabaseSchema.createAccounts,
         OrbitDatabaseSchema.createEmails,

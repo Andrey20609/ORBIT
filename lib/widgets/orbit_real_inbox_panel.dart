@@ -291,7 +291,13 @@ class _RealAccountCard extends StatelessWidget {
             for (final entry in entries)
               Padding(
                 padding: const EdgeInsets.only(top: 6),
-                child: Row(
+                child: InkWell(
+                  key: Key('email-entry-${entry.id}'),
+                  borderRadius: BorderRadius.circular(8),
+                  onTap: () => unawaited(
+                    showEmailBodySheet(context, state, entry),
+                  ),
+                  child: Row(
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
                     Icon(
@@ -353,6 +359,7 @@ class _RealAccountCard extends StatelessWidget {
                       ),
                     ),
                   ],
+                ),
                 ),
               ),
           ],
@@ -615,4 +622,194 @@ final class _SmtpSheetContentsState extends State<_SmtpSheetContents> {
               ),
             );
   }
+}
+
+/// MAIL-02C: детали реального письма - тело on-demand (read-only
+/// BODY.PEEK с size cap) с кэшем в production SQLite и ТОЛЬКО
+/// метаданными вложений (имя/размер/mime); содержимое вложений никогда
+/// не скачивается и не сохраняется. Рендеринг тела - исключительно
+/// plain-text (Flutter Text): HTML/скрипты не исполняются по построению.
+/// Верстка по правилам MAIL-02B r3: useRootNavigator + useSafeArea +
+/// SingleChildScrollView (узкие экраны и системная навигация).
+Future<void> showEmailBodySheet(
+  BuildContext context,
+  OrbitAppState state,
+  UserInboxEntry entry,
+) async {
+  await state.fetchEmailBodyFor(entry.id);
+  if (!context.mounted) return;
+  await showModalBottomSheet<void>(
+    context: context,
+    useRootNavigator: true,
+    isScrollControlled: true,
+    useSafeArea: true,
+    builder: (sheetContext) {
+      return SafeArea(
+        top: false,
+        child: Padding(
+          padding: EdgeInsets.only(
+            left: 16,
+            right: 16,
+            top: 16,
+            bottom: MediaQuery.of(sheetContext).viewPadding.bottom + 16,
+          ),
+          child: SingleChildScrollView(
+            child: ListenableBuilder(
+              listenable: state,
+              builder: (sheetContext, _) {
+                final body = state.cachedBodyFor(entry.id);
+                final error = state.lastBodyFetchError;
+                final loading = state.isBodyFetchInProgress;
+                return Column(
+                  mainAxisSize: MainAxisSize.min,
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      entry.subject.isEmpty ? '(Без темы)' : entry.subject,
+                      key: const Key('email-body-subject'),
+                      style: const TextStyle(
+                        fontWeight: FontWeight.w700,
+                        fontSize: 15,
+                      ),
+                    ),
+                    const SizedBox(height: 4),
+                    Text(
+                      entry.sender,
+                      style: TextStyle(
+                        fontSize: 12,
+                        color: Theme.of(sheetContext)
+                            .colorScheme
+                            .onSurface
+                            .withValues(alpha: 0.7),
+                      ),
+                    ),
+                    const Divider(height: 24),
+                    if (loading && body == null)
+                      const Padding(
+                        padding: EdgeInsets.all(16),
+                        child: Center(
+                          child: SizedBox(
+                            width: 20,
+                            height: 20,
+                            child: CircularProgressIndicator(strokeWidth: 2),
+                          ),
+                        ),
+                      )
+                    else if (body == null && error != null)
+                      Text(
+                        key: const Key('email-body-error'),
+                        error,
+                        style: const TextStyle(
+                          fontSize: 12,
+                          color: Colors.orangeAccent,
+                        ),
+                      )
+                    else if (body != null) ...[
+                      Row(
+                        children: [
+                          Icon(
+                            body.fromCache
+                                ? Icons.cached_rounded
+                                : Icons.cloud_download_outlined,
+                            size: 14,
+                            color:
+                                Theme.of(sheetContext).colorScheme.primary,
+                          ),
+                          const SizedBox(width: 4),
+                          Text(
+                            key: const Key('email-body-source'),
+                            body.fromCache
+                                ? 'Из локального кэша (без сети)'
+                                : 'Загружено с сервера (read-only)',
+                            style: const TextStyle(fontSize: 11),
+                          ),
+                          if (body.truncated) ...[
+                            const SizedBox(width: 8),
+                            const Icon(
+                              Icons.content_cut_rounded,
+                              size: 14,
+                              color: Colors.orangeAccent,
+                            ),
+                            const SizedBox(width: 4),
+                            Flexible(
+                              child: Text(
+                                key: const Key('email-body-truncated'),
+                                'Фрагмент: ${body.bodyText.length} из '
+                                '${body.fullSize} байт',
+                                style: const TextStyle(
+                                  fontSize: 11,
+                                  color: Colors.orangeAccent,
+                                ),
+                              ),
+                            ),
+                          ],
+                        ],
+                      ),
+                      const SizedBox(height: 12),
+                      SelectableText(
+                        key: const Key('email-body-text'),
+                        body.bodyText.isEmpty
+                            ? '(Пустое тело письма)'
+                            : body.bodyText,
+                        style: const TextStyle(fontSize: 13, height: 1.4),
+                      ),
+                      if (body.attachments.isNotEmpty) ...[
+                        const Divider(height: 24),
+                        Text(
+                          'Вложения (${body.attachments.length}) - только '
+                          'метаданные, содержимое не скачивается:',
+                          key: const Key('email-body-attachments-header'),
+                          style: const TextStyle(
+                            fontSize: 12,
+                            fontWeight: FontWeight.w600,
+                          ),
+                        ),
+                        const SizedBox(height: 6),
+                        for (final attachment in body.attachments)
+                          Padding(
+                            padding: const EdgeInsets.only(top: 4),
+                            child: Row(
+                              children: [
+                                const Icon(
+                                  Icons.attach_file_rounded,
+                                  size: 14,
+                                ),
+                                const SizedBox(width: 6),
+                                Expanded(
+                                  child: Text(
+                                    attachment.fileName.isEmpty
+                                        ? '(без имени)'
+                                        : attachment.fileName,
+                                    style: const TextStyle(fontSize: 12),
+                                  ),
+                                ),
+                                Text(
+                                  key: Key(
+                                    'email-attachment-'
+                                    '${attachment.fileName}',
+                                  ),
+                                  '${attachment.mimeType} - '
+                                  '${attachment.sizeBytes} Б',
+                                  style: const TextStyle(fontSize: 11),
+                                ),
+                              ],
+                            ),
+                          ),
+                      ],
+                    ],
+                    const SizedBox(height: 12),
+                    const Text(
+                      'Тело получено по IMAP без изменения состояния '
+                      'сервера (BODY.PEEK); отображение - только текст.',
+                      style: TextStyle(fontSize: 11),
+                    ),
+                  ],
+                );
+              },
+            ),
+          ),
+        ),
+      );
+    },
+  );
 }
