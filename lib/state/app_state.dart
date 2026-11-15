@@ -274,6 +274,11 @@ final class OrbitAppState extends ChangeNotifier {
         replacingSecret ||
         (!isNew && await _credentials.hasAccountSecret(account.id));
     final effective = account.copyWith(
+      // r3 (UX-3): нормализация - случайные пробелы по краям email и
+      // хостов не должны ломать LOGIN/соединение.
+      email: account.email.trim(),
+      incomingHost: account.incomingHost.trim(),
+      outgoingHost: account.outgoingHost.trim(),
       credentialStatus: hasSecret
           ? OrbitMailCredentialStatus.savedUnverified
           : OrbitMailCredentialStatus.notConfigured,
@@ -851,6 +856,47 @@ final class OrbitAppState extends ChangeNotifier {
 
   SmtpSendConfig get smtpSendConfig => _smtpSendConfig;
 
+  // ===== MAIL-02B r3 (UX-3): контролируемый получатель на устройстве =====
+  //
+  // Ровно ОДИН тестовый адрес. Приоритет - dart-define
+  // ORBIT_SMTP_ALLOWED_RECIPIENT; без него пользователь задаёт адрес
+  // прямо на устройстве (без перекомпиляции APK). Значение персистентно
+  // (snapshot), НЕ является секретом, валидируется как email.
+
+  String? _controlledRecipient;
+
+  /// Сохранённый на устройстве контролируемый получатель (или null).
+  String? get controlledRecipient => _controlledRecipient;
+
+  /// Эффективный allowlist для контролируемой отправки: dart-define
+  /// имеет приоритет; иначе - сохранённый адрес (ровно один).
+  List<String> get effectiveAllowedRecipients => _smtpSendConfig.isConfigured
+      ? _smtpSendConfig.allowedRecipients
+      : (_controlledRecipient == null
+            ? const <String>[]
+            : <String>[_controlledRecipient!]);
+
+  /// Сохраняет/обновляет единственный контролируемый получателя.
+  /// Валидация: непустой email-подобный адрес (локальная часть@домен);
+  /// сохранение нормализует регистр домена и пробелы по краям.
+  String? setControlledRecipient(String raw) {
+    final candidate = raw.trim().toLowerCase();
+    final valid = RegExp(
+      '^[^@;:,<>\\s]+@[^@;:,<>\\s]+\\.[^@;:,<>\\s]+\$',
+    ).hasMatch(candidate);
+    if (!valid) {
+      return 'Введите корректный email-адрес получателя';
+    }
+    if (_smtpSendConfig.isConfigured &&
+        !_smtpSendConfig.allows(candidate)) {
+      return 'Конфигурация сборки разрешает только '
+          '${_smtpSendConfig.allowedRecipients.join(', ')}';
+    }
+    _controlledRecipient = candidate;
+    _changed();
+    return null;
+  }
+
   /// Записи персистентного outbox для UI (статусы/ошибки sanitized).
   List<SmtpOutboxRecord> get smtpOutboxEntries =>
       List<SmtpOutboxRecord>.unmodifiable(_smtpOutboxEntries);
@@ -873,14 +919,19 @@ final class OrbitAppState extends ChangeNotifier {
     required String subject,
     required String body,
   }) async {
-    if (!_smtpSendConfig.isConfigured) {
+    // r3 (UX-3): allowlist = dart-define ИЛИ сохранённый на устройстве
+    // контролируемый получатель (ровно один адрес).
+    final allowed = effectiveAllowedRecipients;
+    if (allowed.isEmpty) {
       return _lastSmtpSendOutcome = const SmtpSendOutcome.rejected(
         'Контролируемая отправка не настроена: задайте тестовый адрес '
         'получателя',
       );
     }
     final recipient = to.trim().toLowerCase();
-    if (!_smtpSendConfig.allows(recipient)) {
+    if (!allowed.contains(recipient)) {
+      // Возможна рассинхронизация с сохранённым адресом: авто-сохранение
+      // корректного нового адреса не выполняем молча - честный отказ.
       return _lastSmtpSendOutcome = const SmtpSendOutcome.rejected(
         'Получатель вне разрешённого списка контролируемой отправки',
       );
@@ -1014,7 +1065,9 @@ final class OrbitAppState extends ChangeNotifier {
             resolveAccessToken: (target) =>
                 getValidOAuthAccessToken(target.id),
             credentialService: _credentials,
-            sendConfig: _smtpSendConfig,
+            // r3 (UX-3): эффективный allowlist (dart-define или
+            // сохранённый на устройстве получатель).
+            sendConfig: SmtpSendConfig(effectiveAllowedRecipients),
           );
       for (final record in pending) {
         processedIds.add(record.id);
@@ -1410,6 +1463,12 @@ final class OrbitAppState extends ChangeNotifier {
               .whereType<Map<String, Object?>>()
               .map(OrbitSentMailEntry.fromJson),
         );
+      // MAIL-02B r3: сохранённый контролируемый получатель (не секрет).
+      _controlledRecipient =
+          (state['smtpControlledRecipient'] as String?)?.trim().toLowerCase();
+      if (_controlledRecipient != null && _controlledRecipient!.isEmpty) {
+        _controlledRecipient = null;
+      }
       final mailAccountsRaw = (state['mailAccounts'] as List<Object?>? ?? const [])
           .whereType<Map<String, Object?>>()
           .map(OrbitMailAccount.fromJson)
@@ -1586,6 +1645,8 @@ final class OrbitAppState extends ChangeNotifier {
       'sentEmails': _sentEmails.map((e) => e.toJson()).toList(),
       'mailAccounts': _mailAccounts.map((e) => e.toJson()).toList(),
       'brainChatHistory': _brainChatHistory.map((m) => m.toJson()).toList(),
+      // MAIL-02B r3: контролируемый получатель (не секрет; ровно один).
+      'smtpControlledRecipient': _controlledRecipient,
       ..._draft.toJson(),
     };
     if (!_canEdit) {

@@ -10,6 +10,8 @@ import 'package:orbit_visual_lab/data/drift_local_state_repository.dart';
 import 'package:orbit_visual_lab/data/orbit_local_state_repository.dart';
 import 'package:orbit_visual_lab/data/orbit_secure_store.dart';
 import 'package:orbit_visual_lab/l10n/app_localizations.dart';
+import 'package:orbit_visual_lab/services/mail/imap_readonly_client.dart';
+import 'package:orbit_visual_lab/services/mail/imap_socket.dart';
 import 'package:orbit_visual_lab/services/mail/mail_connection_verifier.dart';
 import 'package:orbit_visual_lab/services/mail/orbit_mail_credential_service.dart';
 import 'package:orbit_visual_lab/services/mail/smtp_mail_transport.dart';
@@ -112,6 +114,30 @@ OrbitMailCredentialService _serviceWithApPassword() {
     service.saveAppPassword(accountId: 'acc_smtp', appPassword: _apPassword),
   );
   return service;
+}
+
+/// Локальный для этого файла IMAP-сокет: только захват записей
+/// (для [S18] - проверка экранирования LOGIN).
+final class _ImapLoginCaptureSocket implements OrbitImapSocket {
+  final List<String> written = <String>[];
+
+  @override
+  Future<void> writeLine(String line) async {
+    written.add(line);
+  }
+
+  @override
+  Future<String> readLine() async {
+    throw const ImapConnectionException('Скрипт ответов исчерпан');
+  }
+
+  @override
+  Future<String> readUtf8Octets(int octets) async {
+    throw const ImapConnectionException('Нет literal-данных');
+  }
+
+  @override
+  void destroy() {}
 }
 
 void main() {
@@ -910,14 +936,14 @@ void main() {
 
       // UI-тест в fake-async зоне: file-SQLite I/O здесь не завершается,
       // поэтому Memory-хранилище (rejected-путь не доходит до outbox).
+      // Конфигурация ПУСТА (без dart-define): поле получателя активно,
+      // prefill отсутствует - валидируем пустой ввод.
       final state = OrbitAppState(
         MemoryLocalStateRepository(),
         MemoryOrbitSecretStore(),
       );
       await state.load();
-      state.debugSmtpConfigForTest(
-        SmtpSendConfig(const <String>[_allowedRecipient]),
-      );
+      state.debugSmtpConfigForTest(SmtpSendConfig.empty);
       await state.saveMailAccountWithCredentials(
         _smtpAccount(),
         appPassword: _apPassword,
@@ -977,9 +1003,15 @@ void main() {
       await tester.pump();
       await tester.pump(const Duration(milliseconds: 400));
 
-      // Отправка: config-проверка отклоняет мгновенно (без I/O в
-      // fake-async зоне UI-теста) — honest rejected путь.
-      state.debugSmtpConfigForTest(SmtpSendConfig.empty);
+      // Отправка без dart-define и без введённого адреса: честная
+      // ошибка валидации получателя (r3: адрес задаётся на устройстве,
+      // пустой/некорректный - explicit rejected, без имитации).
+      // Конфиг пуст УЖЕ при открытии листа (в setup), поле ввода активно,
+      // prefill отсутствует.
+      await tester.enterText(
+        find.byKey(const Key('smtp-sheet-to')),
+        '',
+      );
       await tester.enterText(
         find.byKey(const Key('smtp-sheet-subject')),
         'UI-тест',
@@ -997,11 +1029,279 @@ void main() {
       expect(result.data, contains('rejected'));
       expect(
         result.data,
-        contains('не настроена'),
-        reason: 'честный CONFIG_REQUIRED без имитации отправки',
+        contains('корректный email'),
+        reason: 'честная ошибка валидации контролируемого получателя',
       );
+      expect(state.controlledRecipient, isNull);
       // Секреты в UI-результате отсутствуют.
       expect(result.data!.contains(_apPassword), isFalse);
+    });
+  });
+
+
+  group('MAIL-02B r3 (device regressions)', () {
+    Future<OrbitAppState> stateOnFileSQLite(
+      DriftLocalStateRepository repo,
+      OrbitSecretStore store,
+    ) async {
+      SharedPreferences.setMockInitialValues(const <String, Object>{});
+      final state = OrbitAppState(repo, store);
+      await state.load();
+      return state;
+    }
+
+    SmtpMailTransport transportFor(
+      OrbitAppState state,
+      _FakeSmtpSocket socket,
+    ) => SmtpMailTransport(
+          resolveAccount: (id) async => state.mailAccounts
+              .where((a) => a.id == id)
+              .firstOrNull,
+          resolveAccessToken: (account) async => null,
+          credentialService: _serviceWithApPassword(),
+          sendConfig: SmtpSendConfig(
+            state.effectiveAllowedRecipients,
+          ),
+          clientFactory: (account) async => SmtpSendClient.forSocket(socket),
+        );
+
+    Widget wrapPanel(OrbitAppState state) {
+      final style = OrbitStyleManager(
+        MemoryAppearanceRepository(
+          const AppearanceSettings(
+            profile: OrbitProfile.one,
+            atmosphereMode: AtmosphereMode.automatic,
+            quality: OrbitQuality.eco,
+            motionEnabled: false,
+          ),
+        ),
+      );
+      final quality = OrbitQualityManager();
+      final palette = OrbitPalette.ofBrightness(
+        OrbitProfile.one,
+        Brightness.dark,
+      );
+      return ListenableBuilder(
+        listenable: state,
+        builder: (context, _) => OrbitEnvironment(
+          style: style,
+          quality: quality,
+          appState: state,
+          appearanceSettings: style.settings,
+          resolvedQuality: quality.resolve(style.settings),
+          dataRevision: state.dataRevision,
+          graphicsFallbackReason: null,
+          appearancePersistenceError: null,
+          appearanceLoadError: null,
+          platformBrightness: Brightness.dark,
+          child: MaterialApp(
+            localizationsDelegates:
+                AppLocalizations.localizationsDelegates,
+            supportedLocales: AppLocalizations.supportedLocales,
+            theme: palette.themeData(palette.accent),
+            home: const Scaffold(
+              body: SingleChildScrollView(
+                child: OrbitRealInboxPanel(),
+              ),
+            ),
+          ),
+        ),
+      );
+    }
+
+    testWidgets('[S17] узкий экран 360x780: SMTP-лист - кнопка отправки '
+        'видима и кликабельна над системной навигацией; карточка без '
+        'переполнения', (tester) async {
+      tester.view.physicalSize = const Size(360, 780);
+      tester.view.devicePixelRatio = 1.0;
+      // Системная навигация Android имитируется viewPadding снизу.
+      tester.view.padding = FakeViewPadding(bottom: 24);
+      addTearDown(tester.view.reset);
+
+      final state = OrbitAppState(
+        MemoryLocalStateRepository(),
+        MemoryOrbitSecretStore(),
+      );
+      await state.load();
+      state.debugSmtpConfigForTest(SmtpSendConfig.empty);
+      await state.saveMailAccountWithCredentials(
+        _smtpAccount(),
+        appPassword: _apPassword,
+      );
+      await state.flush();
+
+      await tester.pumpWidget(wrapPanel(state));
+      await tester.pumpAndSettle();
+      await tester.tap(find.byKey(const Key('real-inbox-toggle')));
+      await tester.pumpAndSettle();
+
+      // Карточка на узком экране: никакое переполнение не роняет layout.
+      expect(tester.takeException(), isNull);
+      // Wrap переносит элементы: полные тексты достижимы.
+      expect(find.text('Только чтение'), findsOneWidget);
+      expect(
+        find.text('очередь: 0 · доставлено: 0 · ошибок: 0'),
+        findsOneWidget,
+      );
+      // Кнопка настройки пароля присутствует на карточке (notConfigured
+      // после сброса): здесь статус savedUnverified - кнопки нет.
+      expect(
+        find.byKey(const Key('configure-credentials-acc_smtp')),
+        findsNothing,
+      );
+
+      // Открываем SMTP-лист (root navigator) на узком экране.
+      await tester.tap(find.byKey(const Key('smtp-send-acc_smtp')));
+      await tester.pump();
+      await tester.pump(const Duration(milliseconds: 400));
+
+      // Поле получателя активно (dart-define не задан - сохраняем на
+      // устройстве).
+      await tester.enterText(
+        find.byKey(const Key('smtp-sheet-to')),
+        'device.user@test.local',
+      );
+      await tester.enterText(
+        find.byKey(const Key('smtp-sheet-subject')),
+        'Узкий экран',
+      );
+      await tester.enterText(
+        find.byKey(const Key('smtp-sheet-body')),
+        'Тело',
+      );
+
+      // Кнопка полностью видима и кликабельна (не под системной
+      // навигацией, не под доком).
+      final submit = find.byKey(const Key('smtp-sheet-submit'));
+      await tester.ensureVisible(submit);
+      await tester.pumpAndSettle();
+      await tester.ensureVisible(submit);
+      await tester.pump(const Duration(milliseconds: 100));
+
+      await tester.tap(submit, warnIfMissed: false);
+      await tester.pump();
+      await tester.pump(const Duration(milliseconds: 300));
+      expect(tester.takeException(), isNull);
+
+      // Полный интерактивный путь без dart-define: получатель сохранён
+      // на устройстве, отправка дошла до honest-reject Memory-репо.
+      expect(state.controlledRecipient, 'device.user@test.local');
+      final result = tester.widget<Text>(
+        find.byKey(const Key('smtp-sheet-result')),
+      );
+      expect(result.data, contains('rejected'));
+      expect(
+        result.data,
+        contains('Отправка требует production-хранилища'),
+      );
+    });
+
+    test('[S18] IMAP LOGIN: пароль со спецсимволами корректно '
+        'экранируется в quoted string', () async {
+      final quote = String.fromCharCode(34); // "
+      final backslash = String.fromCharCode(92); // '
+      final password = 'p${quote}a${backslash}b c';
+      final socket = _ImapLoginCaptureSocket();
+      final client = ImapReadOnlyClient.forSocket(socket);
+      // Скрипт пуст: достаточно проверить саму записанную команду.
+      try {
+        await client.login('unit.sender@test.local', password);
+      } catch (_) {
+        // Скрипт исчерпан - команда уже записана, это всё что нужно.
+      }
+      // Ожидание: LOGIN "user" "p\"a\\b c" - кавычка и backslash внутри
+      // пароля экранированы одним backslash, пробел внутри валиден.
+      final escapedQuote = '$backslash$quote';
+      final escapedBackslash = '$backslash$backslash';
+      final expectedPassword = 'p${escapedQuote}a${escapedBackslash}b c';
+      final expectedCommand = 'A1 LOGIN '
+          '$quote'
+          'unit.sender@test.local'
+          '$quote '
+          '$quote'
+          '$expectedPassword'
+          '$quote';
+      expect(socket.written.first, expectedCommand);
+      expect(socket.written.first, 'A1 LOGIN "unit.sender@test.local" "$expectedPassword"');
+    });
+
+    test('[S19] контролируемый получатель без dart-define: сохранение на '
+        'устройстве, allowlist fallback, персистентность', () async {
+      final tempDir = await Directory.systemTemp.createTemp('mail02b_s19');
+      addTearDown(() async {
+        try {
+          await tempDir.delete(recursive: true);
+        } catch (_) {}
+      });
+      final dbFile = File(
+        '${tempDir.path}${Platform.pathSeparator}s19.sqlite',
+      );
+      final repo = DriftLocalStateRepository(
+        database: DriftOrbitDatabase(file: dbFile),
+      );
+      final sharedStore = MemoryOrbitSecretStore();
+      final state = await stateOnFileSQLite(repo, sharedStore);
+      // БЕЗ dart-define: конфигурация пуста.
+      state.debugSmtpConfigForTest(SmtpSendConfig.empty);
+      await state.saveMailAccountWithCredentials(
+        _smtpAccount(),
+        appPassword: _apPassword,
+      );
+      await state.flush();
+
+      // Некорректный адрес отклоняется с понятным сообщением.
+      expect(state.setControlledRecipient('не-email'), isNotNull);
+
+      // Валидный адрес сохраняется (нормализация регистра/пробелов).
+      expect(state.setControlledRecipient('  Device.User@Test.Local  '),
+          isNull);
+      expect(state.controlledRecipient, 'device.user@test.local');
+
+      // Effective allowlist: ровно один адрес; отправка проходит до
+      // транспорта (double) и доставляется.
+      final socket = _fakeSmtp(_sessionLines());
+      state.debugSmtpTransportForTest(transportFor(state, socket));
+      final outcome = await state.sendRealEmail(
+        to: 'device.user@test.local',
+        subject: 'Fallback',
+        body: 'Тело',
+      );
+      expect(outcome.status, 'sent');
+
+      // Посторонний получатель по-прежнему отклонён.
+      final outside = await state.sendRealEmail(
+        to: 'other@evil.test',
+        subject: 'x',
+        body: 'y',
+      );
+      expect(outside.status, 'rejected');
+
+      // Персистентность: snapshot содержит адрес; после «рестарта»
+      // получатель доступен без повторного ввода.
+      final snapshot = await repo.load();
+      expect(snapshot['smtpControlledRecipient'], 'device.user@test.local');
+      final reloaded = await stateOnFileSQLite(repo, sharedStore);
+      expect(reloaded.controlledRecipient, 'device.user@test.local');
+      expect(
+        reloaded.effectiveAllowedRecipients,
+        const <String>['device.user@test.local'],
+      );
+
+      // dart-define имеет приоритет: при заданной конфигурации
+      // сохранённый адрес не расширяет allowlist.
+      reloaded.debugSmtpConfigForTest(
+        SmtpSendConfig(const <String>['hard.lock@test.local']),
+      );
+      expect(
+        reloaded.effectiveAllowedRecipients,
+        const <String>['hard.lock@test.local'],
+      );
+      final blocked = await reloaded.sendRealEmail(
+        to: 'device.user@test.local',
+        subject: 'x',
+        body: 'y',
+      );
+      expect(blocked.status, 'rejected');
     });
   });
 

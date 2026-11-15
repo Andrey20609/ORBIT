@@ -1,7 +1,7 @@
 name: orbit_visual_lab
 description: ORBIT — personal digital ecosystem.
 publish_to: none
-version: 0.5.40+46
+version: 0.5.41+47
 
 environment:
   sdk: ">=3.10.0 <4.0.0"

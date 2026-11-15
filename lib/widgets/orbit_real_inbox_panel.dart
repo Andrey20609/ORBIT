@@ -9,6 +9,7 @@ import '../state/app_state.dart';
 import '../visual_engine/orbit_visual_engine.dart';
 import 'glass_panel.dart';
 import 'orbit_environment.dart';
+import 'orbit_mail_account_sheet.dart';
 import 'orbit_spatial_surfaces.dart';
 
 /// MAIL-02A: настоящий read-only INBOX. Отдельная секция от DEMO-писем.
@@ -196,7 +197,12 @@ class _RealAccountCard extends StatelessWidget {
             ],
           ),
           const SizedBox(height: 8),
-          Row(
+          // MAIL-02B r3 (UI-2): Wrap вместо Row - на узких экранах
+          // элементы переносятся на следующую строку без обрезки.
+          Wrap(
+            spacing: 8,
+            runSpacing: 4,
+            crossAxisAlignment: WrapCrossAlignment.center,
             children: [
               TextButton.icon(
                 key: Key('real-inbox-sync-${account.id}'),
@@ -215,23 +221,43 @@ class _RealAccountCard extends StatelessWidget {
                   style: TextStyle(fontSize: 12),
                 ),
               ),
-              const SizedBox(width: 8),
               Icon(
                 Icons.lock_outline_rounded,
                 size: 14,
                 color: palette.textSecondary,
               ),
-              const SizedBox(width: 4),
+              const SizedBox(width: 2),
               Text(
                 'Только чтение',
                 style: TextStyle(fontSize: 11, color: palette.textSecondary),
               ),
             ],
           ),
+          // MAIL-02B r3 (UX-3): после auth-rejection (notConfigured) у
+          // пользователя остаётся явное действие - настроить пароль.
+          if (account.credentialStatus ==
+              OrbitMailCredentialStatus.notConfigured)
+            Align(
+              alignment: Alignment.centerLeft,
+              child: TextButton.icon(
+                key: Key('configure-credentials-${account.id}'),
+                onPressed: () => unawaited(
+                  _openAccountSettings(context, state, palette),
+                ),
+                icon: const Icon(Icons.key_rounded, size: 16),
+                label: const Text(
+                  'Настроить пароль / войти',
+                  style: TextStyle(fontSize: 12),
+                ),
+              ),
+            ),
           // MAIL-02B: контролируемая SMTP-отправка (один разрешённый
           // получатель из конфигурации; персистентный outbox с retry).
           const SizedBox(height: 4),
-          Row(
+          Wrap(
+            spacing: 8,
+            runSpacing: 4,
+            crossAxisAlignment: WrapCrossAlignment.center,
             children: [
               TextButton.icon(
                 key: Key('smtp-send-${account.id}'),
@@ -243,7 +269,6 @@ class _RealAccountCard extends StatelessWidget {
                   style: TextStyle(fontSize: 12),
                 ),
               ),
-              const SizedBox(width: 4),
               Text(
                 _outboxSummary(state.smtpOutboxEntries, account.id),
                 style: TextStyle(
@@ -349,145 +374,47 @@ String _outboxSummary(List<SmtpOutboxRecord> entries, String accountId) {
   return 'очередь: $queued · доставлено: $sent · ошибок: $failed';
 }
 
-/// MAIL-02B: контролируемая SMTP-отправка. Получатель ограничен
-/// конфигурацией (prefill единственного разрешённого адреса, если он
-/// один); результат — sanitized статус из персистентного outbox.
+/// MAIL-02B r3 (UX-3): открытие листа настроек аккаунтов с листа
+/// реального ящика (выход из тупика notConfigured).
+Future<void> _openAccountSettings(
+  BuildContext context,
+  OrbitAppState state,
+  OrbitPalette palette,
+) {
+  return showOrbitMailAccountsSheet(context, palette: palette);
+}
+
+/// MAIL-02B: контролируемая SMTP-отправка. Ровно ОДИН разрешённый
+/// получатель: dart-define ORBIT_SMTP_ALLOWED_RECIPIENT (приоритет)
+/// ЛИБО адрес, сохранённый пользователем на устройстве (r3: без
+/// перекомпиляции APK). Результат - sanitized статус из персистентного
+/// outbox.
 Future<void> showSmtpSendSheet(
   BuildContext context,
   OrbitAppState state,
   OrbitMailAccount account,
 ) async {
-  final allowed = state.smtpSendConfig.allowedRecipients;
-  // MAIL-02B r2 (блокер 3): контроллеры создаются ОДИН раз до листа и
+  // r2 (блокер 3): контроллеры создаются ОДИН раз до листа и
   // освобождаются после его закрытия - никаких пересозданий на ребилдах
   // StatefulBuilder и никаких утечек.
-  final toController = TextEditingController(
-    text: allowed.isEmpty ? '' : allowed.first,
-  );
+  final toController = TextEditingController();
   final subjectController = TextEditingController();
   final bodyController = TextEditingController();
   try {
     await showModalBottomSheet<void>(
       context: context,
+      // r3 (UI-1): root navigator - лист открывается ПОВЕРХ нижнего
+      // дока навигации OrbitShell, а не под ним.
+      useRootNavigator: true,
       isScrollControlled: true,
+      // r3 (UI-1): системная навигация Android не перекрывает контент.
+      useSafeArea: true,
       builder: (sheetContext) {
-        var busy = false;
-        String? resultText;
-        return StatefulBuilder(
-          builder: (sheetContext, setSheetState) {
-            Future<void> submit() async {
-              setSheetState(() {
-                busy = true;
-                resultText = null;
-              });
-              final outcome = await state.sendRealEmail(
-                to: toController.text,
-                subject: subjectController.text,
-                body: bodyController.text,
-              );
-              await state.refreshSmtpOutboxEntries();
-              setSheetState(() {
-                busy = false;
-                resultText = '${outcome.status}: ${outcome.message}';
-              });
-            }
-
-            return Padding(
-              padding: EdgeInsets.only(
-                left: 16,
-                right: 16,
-                top: 16,
-                bottom: MediaQuery.of(sheetContext).viewInsets.bottom + 16,
-              ),
-              child: Column(
-                mainAxisSize: MainAxisSize.min,
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  Row(
-                    children: [
-                      Icon(
-                        Icons.forward_to_inbox_rounded,
-                        size: 18,
-                        color: Theme.of(sheetContext).colorScheme.primary,
-                      ),
-                      const SizedBox(width: 8),
-                      const Expanded(
-                        child: Text(
-                          'SMTP: контрольная отправка',
-                          style: TextStyle(fontWeight: FontWeight.w700),
-                        ),
-                      ),
-                    ],
-                  ),
-                  const SizedBox(height: 4),
-                  Text(
-                    allowed.isEmpty
-                        ? 'Получатель не настроен: задайте тестовый адрес '
-                            'получателя в конфигурации сборки.'
-                        : 'Разрешённый получатель: ${allowed.join(', ')}',
-                    style: const TextStyle(fontSize: 12),
-                  ),
-                  const SizedBox(height: 10),
-                  TextField(
-                    key: const Key('smtp-sheet-to'),
-                    controller: toController,
-                    enabled: allowed.length != 1,
-                    decoration: const InputDecoration(
-                      labelText: 'Кому (разрешённый получатель)',
-                      border: OutlineInputBorder(),
-                    ),
-                  ),
-                  const SizedBox(height: 8),
-                  TextField(
-                    key: const Key('smtp-sheet-subject'),
-                    controller: subjectController,
-                    decoration: const InputDecoration(
-                      labelText: 'Тема',
-                      border: OutlineInputBorder(),
-                    ),
-                  ),
-                  const SizedBox(height: 8),
-                  TextField(
-                    key: const Key('smtp-sheet-body'),
-                    controller: bodyController,
-                    maxLines: 4,
-                    decoration: const InputDecoration(
-                      labelText: 'Текст письма',
-                      border: OutlineInputBorder(),
-                    ),
-                  ),
-                  const SizedBox(height: 10),
-                  FilledButton.icon(
-                    key: const Key('smtp-sheet-submit'),
-                    onPressed: busy || allowed.isEmpty ? null : submit,
-                    icon: busy
-                        ? const SizedBox(
-                            width: 14,
-                            height: 14,
-                            child: CircularProgressIndicator(strokeWidth: 2),
-                          )
-                        : const Icon(Icons.send_rounded, size: 16),
-                    label: const Text('Поставить в очередь и отправить'),
-                  ),
-                  if (resultText != null) ...[
-                    const SizedBox(height: 8),
-                    Text(
-                      key: const Key('smtp-sheet-result'),
-                      resultText!,
-                      style: const TextStyle(fontSize: 12),
-                    ),
-                  ],
-                  const SizedBox(height: 8),
-                  const Text(
-                    'Письмо попадает в персистентную очередь: retry при '
-                    'сетевых сбоях, без дубликатов; содержимое и статус — '
-                    'только в локальной базе устройства.',
-                    style: TextStyle(fontSize: 11),
-                  ),
-                ],
-              ),
-            );
-          },
+        return _SmtpSheetContents(
+          state: state,
+          toController: toController,
+          subjectController: subjectController,
+          bodyController: bodyController,
         );
       },
     );
@@ -495,5 +422,197 @@ Future<void> showSmtpSendSheet(
     toController.dispose();
     subjectController.dispose();
     bodyController.dispose();
+  }
+}
+
+/// r3: busy/resultText живут в State - лист может пересоздаваться
+/// (глобальный rebuild при notify app_state), но состояние отправки
+/// переживает пересоздание (Element reuse) и результат не теряется.
+final class _SmtpSheetContents extends StatefulWidget {
+  const _SmtpSheetContents({
+    required this.state,
+    required this.toController,
+    required this.subjectController,
+    required this.bodyController,
+  });
+
+  final OrbitAppState state;
+  final TextEditingController toController;
+  final TextEditingController subjectController;
+  final TextEditingController bodyController;
+
+  @override
+  State<_SmtpSheetContents> createState() => _SmtpSheetContentsState();
+}
+
+final class _SmtpSheetContentsState extends State<_SmtpSheetContents> {
+  bool _busy = false;
+  String? _resultText;
+
+  Future<void> _submit() async {
+    setState(() {
+      _busy = true;
+      _resultText = null;
+    });
+    final state = widget.state;
+    final hardLocked = state.smtpSendConfig.isConfigured;
+    // r3 (UX-3): без dart-define получатель сохраняется на устройстве
+    // (ровно один, с валидацией) прямо при отправке.
+    if (!hardLocked) {
+      final saveError = state.setControlledRecipient(
+        widget.toController.text,
+      );
+      if (saveError != null) {
+        setState(() {
+          _busy = false;
+          _resultText = 'rejected: $saveError';
+        });
+        return;
+      }
+    }
+    final outcome = await state.sendRealEmail(
+      to: widget.toController.text,
+      subject: widget.subjectController.text,
+      body: widget.bodyController.text,
+    );
+    await state.refreshSmtpOutboxEntries();
+    if (!mounted) return;
+    setState(() {
+      _busy = false;
+      _resultText = '${outcome.status}: ${outcome.message}';
+    });
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final state = widget.state;
+    final sheetContext = context;
+    final toController = widget.toController;
+    final configured = state.smtpSendConfig;
+    final hardLocked = configured.isConfigured;
+    final savedRecipient = state.controlledRecipient;
+    final effectiveRecipient = hardLocked
+        ? configured.allowedRecipients.first
+        : savedRecipient;
+    if (toController.text.isEmpty && effectiveRecipient != null) {
+      // Prefill без слушателя: присваивание идемпотентно, пока поле
+      // не редактировалось вручную.
+      toController.text = effectiveRecipient;
+    }
+    final busy = _busy;
+    final resultText = _resultText;
+    Future<void> submit() => _submit();
+
+    final media = MediaQuery.of(sheetContext);
+            // r3 (UI-1): клавиатура И системная навигация; при открытой
+            // клавиатуре viewPadding уже не «съедается» SafeArea.
+            final bottomInset = media.viewInsets.bottom > 0
+                ? media.viewInsets.bottom + 12
+                : media.viewPadding.bottom + 16;
+            return Padding(
+              padding: EdgeInsets.only(left: 16, right: 16, top: 16),
+              child: SingleChildScrollView(
+                child: Padding(
+                  padding: EdgeInsets.only(bottom: bottomInset),
+                  child: Column(
+                    mainAxisSize: MainAxisSize.min,
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Row(
+                        children: [
+                          Icon(
+                            Icons.forward_to_inbox_rounded,
+                            size: 18,
+                            color: Theme.of(sheetContext).colorScheme.primary,
+                          ),
+                          const SizedBox(width: 8),
+                          const Expanded(
+                            child: Text(
+                              'SMTP: контрольная отправка',
+                              style: TextStyle(fontWeight: FontWeight.w700),
+                            ),
+                          ),
+                        ],
+                      ),
+                      const SizedBox(height: 4),
+                      Text(
+                        hardLocked
+                            ? 'Разрешённый получатель (из конфигурации '
+                                  'сборки): $effectiveRecipient'
+                            : savedRecipient == null
+                            ? 'Получатель не задан: введите ОДИН '
+                                  'контролируемый тестовый адрес - он '
+                                  'сохранится на устройстве.'
+                            : 'Сохранённый получатель (на устройстве): '
+                                  '$savedRecipient',
+                        key: const Key('smtp-sheet-recipient-hint'),
+                        style: const TextStyle(fontSize: 12),
+                      ),
+                      const SizedBox(height: 10),
+                      TextField(
+                        key: const Key('smtp-sheet-to'),
+                        controller: toController,
+                        enabled: !hardLocked,
+                        decoration: const InputDecoration(
+                          labelText: 'Кому (разрешённый получатель)',
+                          border: OutlineInputBorder(),
+                        ),
+                      ),
+                      const SizedBox(height: 8),
+                      TextField(
+                        key: const Key('smtp-sheet-subject'),
+                        controller: widget.subjectController,
+                        decoration: const InputDecoration(
+                          labelText: 'Тема',
+                          border: OutlineInputBorder(),
+                        ),
+                      ),
+                      const SizedBox(height: 8),
+                      TextField(
+                        key: const Key('smtp-sheet-body'),
+                        controller: widget.bodyController,
+                        maxLines: 4,
+                        decoration: const InputDecoration(
+                          labelText: 'Текст письма',
+                          border: OutlineInputBorder(),
+                        ),
+                      ),
+                      const SizedBox(height: 10),
+                      FilledButton.icon(
+                        key: const Key('smtp-sheet-submit'),
+                        onPressed: busy ? null : submit,
+                        icon: busy
+                            ? const SizedBox(
+                                width: 14,
+                                height: 14,
+                                child: CircularProgressIndicator(
+                                  strokeWidth: 2,
+                                ),
+                              )
+                            : const Icon(Icons.send_rounded, size: 16),
+                        label: const Text('Поставить в очередь и отправить'),
+                      ),
+                      if (resultText != null) ...[
+                        const SizedBox(height: 8),
+                        Text(
+                          key: const Key('smtp-sheet-result'),
+                          resultText,
+                          style: const TextStyle(fontSize: 12),
+                        ),
+                      ],
+                      const SizedBox(height: 8),
+                      const Text(
+                        'Письмо попадает в персистентную очередь: retry при '
+                        'сетевых сбоях, без дубликатов; содержимое и статус - '
+                        'только в локальной базе устройства. Для '
+                        'Яндекс/Mail.ru/Gmail нужен именно пароль '
+                        'приложения, а не пароль аккаунта.',
+                        style: TextStyle(fontSize: 11),
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+            );
   }
 }
