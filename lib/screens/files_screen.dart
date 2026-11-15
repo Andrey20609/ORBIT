@@ -1,8 +1,11 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 import 'package:go_router/go_router.dart';
 
 import '../data/database/memory_orbit_database.dart';
 import '../data/database/orbit_data_engine.dart';
+import '../data/drift_local_state_repository.dart';
 import '../data/models/file_record.dart';
 import '../services/files/orbit_file_manager.dart';
 import '../visual_engine/orbit_palette.dart';
@@ -18,7 +21,10 @@ final class FilesScreen extends StatefulWidget {
 }
 
 final class _FilesScreenState extends State<FilesScreen> {
-  late final OrbitFileManager _fileManager;
+  OrbitFileManager? _fileManager;
+  OrbitDataEngine? _engine;
+  String? _loadedWorkspaceId;
+  bool _engineReady = false;
   List<FileRecord> _files = [];
   String _selectedFilter = 'Все';
   int _totalBytes = 0;
@@ -27,55 +33,94 @@ final class _FilesScreenState extends State<FilesScreen> {
   @override
   void initState() {
     super.initState();
-    final engine = OrbitDataEngine(MemoryOrbitDatabase(autoSeed: true));
-    _fileManager = OrbitFileManager(dataEngine: engine);
-    _seedInitialFilesAndLoad();
   }
 
-  Future<void> _seedInitialFilesAndLoad() async {
-    try {
-      final existing = await _fileManager.getFiles();
-      if (existing.isEmpty) {
-        // Seed default reference files from the spec/UI boards
-        await _fileManager.attachFile(
-          fileName: 'План_недели.pdf',
-          sizeBytes: 2516582, // 2.4 MB
-          mimeType: 'application/pdf',
-          associatedEntityType: 'email',
-          associatedEntityId: 'review',
-        );
-        await _fileManager.attachFile(
-          fileName: 'График.xlsx',
-          sizeBytes: 1153433, // 1.1 MB
-          mimeType: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
-          associatedEntityType: 'email',
-          associatedEntityId: 'review',
-        );
-        await _fileManager.attachFile(
-          fileName: 'Презентация.pdf',
-          sizeBytes: 8178892, // 7.8 MB
-          mimeType: 'application/pdf',
-          associatedEntityType: 'email',
-          associatedEntityId: 'compose',
-        );
-        await _fileManager.attachFile(
-          fileName: 'Техническое_задание_v1.0.pdf',
-          sizeBytes: 3145728, // 3.0 MB
-          mimeType: 'application/pdf',
-          associatedEntityType: 'task',
-        );
-      }
-      await _loadFiles();
-    } catch (_) {
-      if (mounted) setState(() => _isLoading = false);
+  @override
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+    if (!_engineReady) {
+      _engineReady = true;
+      unawaited(_ensureEngine());
+    } else {
+      unawaited(_syncWorkspace());
     }
+  }
+
+  /// P3-01: движок поверх production SQLite (единый владелец файла -
+  /// DriftLocalStateRepository) с активным workspace; fallback на
+  /// Memory-движок для memory-репозитория (тесты). Production Files
+  /// стартуют пустыми честно - seed-контент это DEMO-механика.
+  Future<void> _ensureEngine() async {
+    final state = OrbitEnvironment.of(context).appState;
+    final repo = state.repository;
+    OrbitDataEngine engine;
+    if (repo is DriftLocalStateRepository) {
+      engine = OrbitDataEngine(await repo.outboxDatabase());
+      _loadedWorkspaceId = state.activeWorkspaceId;
+      engine.setActiveWorkspace(_loadedWorkspaceId!);
+    } else {
+      engine = OrbitDataEngine(MemoryOrbitDatabase(autoSeed: true));
+      _loadedWorkspaceId = engine.activeWorkspaceId;
+      await _seedDemoReferenceFiles();
+    }
+    _engine = engine;
+    _fileManager = OrbitFileManager(dataEngine: engine);
+    await _loadFiles();
+  }
+
+  /// Seed DEMO-справочных файлов - только для Memory-движка (fallback).
+  Future<void> _seedDemoReferenceFiles() async {
+    final manager = _fileManager;
+    if (manager == null) return;
+    try {
+      await manager.attachFile(
+        fileName: 'План_недели.pdf',
+        sizeBytes: 2516582, // 2.4 MB
+        mimeType: 'application/pdf',
+        associatedEntityType: 'email',
+        associatedEntityId: 'review',
+      );
+      await manager.attachFile(
+        fileName: 'График.xlsx',
+        sizeBytes: 1153433, // 1.1 MB
+        mimeType: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+        associatedEntityType: 'email',
+        associatedEntityId: 'review',
+      );
+      await manager.attachFile(
+        fileName: 'Презентация.pdf',
+        sizeBytes: 8178892, // 7.8 MB
+        mimeType: 'application/pdf',
+        associatedEntityType: 'email',
+        associatedEntityId: 'compose',
+      );
+      await manager.attachFile(
+        fileName: 'Техническое_задание_v1.0.pdf',
+        sizeBytes: 3145728, // 3.0 MB
+        mimeType: 'application/pdf',
+        associatedEntityType: 'task',
+      );
+    } catch (_) {
+      // Seed не критичен.
+    }
+  }
+
+  /// Смена активного пространства - перезагрузка данных.
+  Future<void> _syncWorkspace() async {
+    final engine = _engine;
+    if (engine == null) return;
+    final state = OrbitEnvironment.of(context).appState;
+    if (state.activeWorkspaceId == _loadedWorkspaceId) return;
+    engine.setActiveWorkspace(state.activeWorkspaceId);
+    _loadedWorkspaceId = state.activeWorkspaceId;
+    await _loadFiles();
   }
 
   Future<void> _loadFiles() async {
     setState(() => _isLoading = true);
     try {
-      final files = await _fileManager.getFiles();
-      final total = await _fileManager.getTotalStorageUsed();
+      final files = await _fileManager!.getFiles();
+      final total = await _fileManager!.getTotalStorageUsed();
       if (mounted) {
         setState(() {
           _files = files;
@@ -143,7 +188,7 @@ final class _FilesScreenState extends State<FilesScreen> {
           icon: Icons.upload_file_rounded,
           tooltip: 'Загрузить файл',
           onTap: () async {
-            await _fileManager.attachFile(
+            await _fileManager!.attachFile(
               fileName: 'Новый_документ_${DateTime.now().millisecond}.pdf',
               sizeBytes: 1572864, // 1.5 MB
               mimeType: 'application/pdf',
@@ -337,7 +382,7 @@ final class _FilesScreenState extends State<FilesScreen> {
                       IconButton(
                         icon: const Icon(Icons.delete_outline_rounded, color: Colors.redAccent, size: 20),
                         onPressed: () async {
-                          await _fileManager.removeFile(file.id);
+                          await _fileManager!.removeFile(file.id);
                           await _loadFiles();
                         },
                       ),

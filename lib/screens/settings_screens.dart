@@ -9,6 +9,7 @@ import '../widgets/orbit_logo.dart';
 import '../widgets/orbit_mail_account_sheet.dart';
 import '../widgets/orbit_page.dart';
 import '../widgets/orbit_photoreal_scene.dart';
+import '../widgets/orbit_workspace_switcher.dart';
 
 final class SettingsScreen extends StatelessWidget {
   const SettingsScreen({super.key});
@@ -178,6 +179,16 @@ final class SettingsScreen extends StatelessWidget {
             padding: EdgeInsets.zero,
             child: Column(
               children: [
+                _SettingsTile(
+                  icon: Icons.dashboard_customize_rounded,
+                  title: 'Пространства',
+                  subtitle: 'Личное / Рабочее — изоляция задач и заметок',
+                  onTap: () => showWorkspaceSwitcherSheet(
+                              context,
+                              OrbitEnvironment.of(context).appState,
+                            ),
+                ),
+                const Divider(height: 1, indent: 54),
                 _SettingsTile(
                   icon: Icons.mark_email_read_outlined,
                   title: 'Почтовые аккаунты',

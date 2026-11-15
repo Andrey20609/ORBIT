@@ -1,8 +1,11 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 import 'package:go_router/go_router.dart';
 
 import '../data/database/memory_orbit_database.dart';
 import '../data/database/orbit_data_engine.dart';
+import '../data/drift_local_state_repository.dart';
 import '../data/models/note_record.dart';
 import '../services/notes/notes_service.dart';
 import '../visual_engine/orbit_palette.dart';
@@ -20,7 +23,10 @@ final class NotesScreen extends StatefulWidget {
 }
 
 final class _NotesScreenState extends State<NotesScreen> {
-  late final NotesService _notesService;
+  NotesService? _notesService;
+  OrbitDataEngine? _engine;
+  String? _loadedWorkspaceId;
+  bool _engineReady = false;
   List<NoteRecord> _notes = [];
   Set<String> _tags = {};
   String? _selectedTag;
@@ -30,14 +36,53 @@ final class _NotesScreenState extends State<NotesScreen> {
   @override
   void initState() {
     super.initState();
-    final engine = OrbitDataEngine(MemoryOrbitDatabase(autoSeed: true));
-    _notesService = NotesService(dataEngine: engine);
-    _loadNotes();
 
     if (widget.openAdd) {
       WidgetsBinding.instance.addPostFrameCallback((_) {
         _showEditNoteDialog();
       });
+    }
+  }
+
+  /// P3-01: движок поверх production SQLite (единый владелец файла -
+  /// DriftLocalStateRepository) с активным workspace; fallback на
+  /// Memory-движок для memory-репозитория (тесты).
+  Future<void> _ensureEngine() async {
+    final state = OrbitEnvironment.of(context).appState;
+    final repo = state.repository;
+    OrbitDataEngine engine;
+    if (repo is DriftLocalStateRepository) {
+      engine = OrbitDataEngine(await repo.outboxDatabase());
+      _loadedWorkspaceId = state.activeWorkspaceId;
+      engine.setActiveWorkspace(_loadedWorkspaceId!);
+    } else {
+      engine = OrbitDataEngine(MemoryOrbitDatabase(autoSeed: true));
+      _loadedWorkspaceId = engine.activeWorkspaceId;
+    }
+    _engine = engine;
+    _notesService = NotesService(dataEngine: engine);
+    await _loadNotes();
+  }
+
+  /// P3-01: смена активного пространства - перезагрузка данных.
+  Future<void> _syncWorkspace() async {
+    final engine = _engine;
+    if (engine == null) return;
+    final state = OrbitEnvironment.of(context).appState;
+    if (state.activeWorkspaceId == _loadedWorkspaceId) return;
+    engine.setActiveWorkspace(state.activeWorkspaceId);
+    _loadedWorkspaceId = state.activeWorkspaceId;
+    await _loadNotes();
+  }
+
+  @override
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+    if (!_engineReady) {
+      _engineReady = true;
+      unawaited(_ensureEngine());
+    } else {
+      unawaited(_syncWorkspace());
     }
   }
 
@@ -50,8 +95,8 @@ final class _NotesScreenState extends State<NotesScreen> {
   Future<void> _loadNotes() async {
     setState(() => _isLoading = true);
     try {
-      final notes = await _notesService.getNotes(tagFilter: _selectedTag);
-      final tags = await _notesService.getAllTags();
+      final notes = await _notesService!.getNotes(tagFilter: _selectedTag);
+      final tags = await _notesService!.getAllTags();
       if (mounted) {
         setState(() {
           _notes = notes;
@@ -112,7 +157,7 @@ final class _NotesScreenState extends State<NotesScreen> {
                     IconButton(
                       icon: const Icon(Icons.delete_outline_rounded, color: Colors.redAccent),
                       onPressed: () async {
-                        await _notesService.deleteNote(existing.id);
+                        await _notesService!.deleteNote(existing.id);
                         if (sheetContext.mounted) Navigator.of(sheetContext).pop();
                         await _loadNotes();
                       },
@@ -172,13 +217,13 @@ final class _NotesScreenState extends State<NotesScreen> {
                           .toList();
 
                       if (existing == null) {
-                        await _notesService.createNote(
+                        await _notesService!.createNote(
                           title: title,
                           content: contentCtrl.text.trim(),
                           tags: tags,
                         );
                       } else {
-                        await _notesService.updateNote(
+                        await _notesService!.updateNote(
                           existing.copyWith(
                             title: title,
                             content: contentCtrl.text.trim(),
@@ -249,7 +294,7 @@ final class _NotesScreenState extends State<NotesScreen> {
                       border: InputBorder.none,
                     ),
                     onChanged: (q) async {
-                      final res = await _notesService.searchNotes(q);
+                      final res = await _notesService!.searchNotes(q);
                       setState(() => _notes = res);
                     },
                   ),

@@ -67,6 +67,18 @@ final class OrbitDataEngine extends ChangeNotifier {
     notifyListeners();
   }
 
+  /// P3-01: удаление пространства из таблицы workspaces. Данные
+  /// сущностей (workspace_id в задачах/заметках/...) НЕ удаляются.
+  Future<void> deleteWorkspace(String workspaceId) async {
+    await ensureInitialized();
+    await _db.delete(
+      OrbitDatabaseSchema.tableWorkspaces,
+      where: 'id = ?',
+      whereArgs: [workspaceId],
+    );
+    notifyListeners();
+  }
+
   // --- Tasks ---
 
   Future<List<TaskRecord>> getTasks({String? workspaceId}) async {

@@ -3,6 +3,7 @@ import 'package:go_router/go_router.dart';
 
 import '../data/database/memory_orbit_database.dart';
 import '../data/database/orbit_data_engine.dart';
+import '../data/drift_local_state_repository.dart';
 import '../services/search/search_models.dart';
 import '../services/search/unified_search_service.dart';
 import '../visual_engine/orbit_palette.dart';
@@ -19,18 +20,54 @@ final class SearchScreen extends StatefulWidget {
 
 final class _SearchScreenState extends State<SearchScreen> {
   final TextEditingController _searchController = TextEditingController();
-  late final UnifiedSearchService _searchService;
+  UnifiedSearchService? _searchService;
   List<SearchResultItem> _results = [];
   SearchCategory? _selectedCategory;
   bool _isLoading = false;
 
+  OrbitDataEngine? _engine;
+  String? _loadedWorkspaceId;
+  bool _engineReady = false;
+
   @override
-  void initState() {
-    super.initState();
-    // Default shared or memory instance
-    final engine = OrbitDataEngine(MemoryOrbitDatabase(autoSeed: true));
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+    if (!_engineReady) {
+      _engineReady = true;
+      _ensureEngine();
+    } else {
+      _syncWorkspace();
+    }
+  }
+
+  /// P3-01: движок поверх production SQLite с активным workspace;
+  /// fallback - Memory-движок (memory-репозиторий / тесты).
+  Future<void> _ensureEngine() async {
+    final state = OrbitEnvironment.of(context).appState;
+    final repo = state.repository;
+    OrbitDataEngine engine;
+    if (repo is DriftLocalStateRepository) {
+      engine = OrbitDataEngine(await repo.outboxDatabase());
+      _loadedWorkspaceId = state.activeWorkspaceId;
+      engine.setActiveWorkspace(_loadedWorkspaceId!);
+    } else {
+      engine = OrbitDataEngine(MemoryOrbitDatabase(autoSeed: true));
+      _loadedWorkspaceId = engine.activeWorkspaceId;
+    }
+    _engine = engine;
     _searchService = UnifiedSearchService(engine);
-    _performSearch('');
+    await _performSearch(_searchController.text);
+  }
+
+  /// P3-01: смена активного пространства - перезагрузка результатов.
+  Future<void> _syncWorkspace() async {
+    final engine = _engine;
+    if (engine == null) return;
+    final state = OrbitEnvironment.of(context).appState;
+    if (state.activeWorkspaceId == _loadedWorkspaceId) return;
+    engine.setActiveWorkspace(state.activeWorkspaceId);
+    _loadedWorkspaceId = state.activeWorkspaceId;
+    await _performSearch(_searchController.text);
   }
 
   @override
@@ -42,7 +79,7 @@ final class _SearchScreenState extends State<SearchScreen> {
   Future<void> _performSearch(String query) async {
     setState(() => _isLoading = true);
     try {
-      final results = await _searchService.search(
+      final results = await _searchService!.search(
         query,
         category: _selectedCategory ?? SearchCategory.all,
       );

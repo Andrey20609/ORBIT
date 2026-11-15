@@ -4,8 +4,10 @@ import 'package:flutter/material.dart';
 
 
 import '../core/module_interfaces.dart';
+import '../data/database/orbit_data_engine.dart';
 import '../data/demo_data.dart';
 import '../data/drift_local_state_repository.dart';
+import '../data/models/workspace_record.dart';
 import '../data/orbit_corrupt_data.dart';
 import '../data/orbit_load_status.dart';
 import '../data/orbit_local_state_codec.dart';
@@ -1165,6 +1167,158 @@ final class OrbitAppState extends ChangeNotifier {
     _notify();
   }
 
+  // ===== P3-01: Workspaces Foundation =====
+
+  /// Пространства пользователя. Инициализируются дефолтами (Работа /
+  /// Личное / Проекты), персистентно в snapshot И в production SQLite
+  /// (таблица workspaces). НЕ секреты.
+  final List<WorkspaceRecord> _workspaces =
+      List.of(WorkspaceRecord.defaultWorkspaces);
+  String _activeWorkspaceId = 'workspace-work';
+
+  List<WorkspaceRecord> get workspaces =>
+      List<WorkspaceRecord>.unmodifiable(_workspaces);
+
+  String get activeWorkspaceId => _activeWorkspaceId;
+
+  /// Активное пространство (или null, если id вне списка).
+  WorkspaceRecord? get activeWorkspace {
+    for (final ws in _workspaces) {
+      if (ws.id == _activeWorkspaceId) return ws;
+    }
+    return null;
+  }
+
+  /// Production SQLite для workspace-операций (тот же файл, тот же
+  /// владелец). null - если репозиторий не production.
+  Future<OrbitDataEngine?> workspaceDataEngine() async {
+    final repository = _repository;
+    if (repository is! DriftLocalStateRepository) return null;
+    return repository.mailDataEngine();
+  }
+
+  /// Загрузка/склейка пространств из snapshot + production SQLite.
+  /// Вызывается из load() после чтения state.
+  Future<void> _loadWorkspaces(Map<String, Object?> state) async {
+    // 1. Snapshot-список (источник созданных пользователем пространств).
+    final snapshotWorkspaces = (state['workspaces'] as List<Object?>? ?? const [])
+        .whereType<Map<String, Object?>>()
+        .map(WorkspaceRecord.fromMap)
+        .toList();
+    if (snapshotWorkspaces.isNotEmpty) {
+      _workspaces
+        ..clear()
+        ..addAll(snapshotWorkspaces);
+    }
+    final snapshotActive =
+        state['activeWorkspaceId'] as String? ?? 'workspace-work';
+
+    // 2. Production SQLite: строки workspaces (дефолты засеяны drift'ом,
+    //    созданные пользователем — из snapshot при первом сохранении).
+    final engine = await workspaceDataEngine();
+    if (engine != null) {
+      final dbRows = await engine.getWorkspaces();
+      final byId = <String, WorkspaceRecord>{
+        for (final row in dbRows) row.id: row,
+      };
+      // Склейка: snapshot-список - авторитет по порядку; отсутствующие
+      // в production строки SQLite (после чистой установки) добавляются.
+      final merged = <WorkspaceRecord>[];
+      for (final ws in _workspaces) {
+        merged.add(byId[ws.id] ?? ws);
+      }
+      for (final row in dbRows) {
+        if (!merged.any((ws) => ws.id == row.id)) merged.add(row);
+      }
+      _workspaces
+        ..clear()
+        ..addAll(merged);
+    }
+
+    // 3. Активное пространство: валидация + fallback на дефолт.
+    if (!_workspaces.any((ws) => ws.id == snapshotActive)) {
+      _activeWorkspaceId = 'workspace-work';
+    } else {
+      _activeWorkspaceId = snapshotActive;
+    }
+  }
+
+  /// Переключение активного пространства. Честная ошибка, если id не
+  /// существует (без молчаливого fallback).
+  Future<bool> switchWorkspace(String workspaceId) async {
+    final index = _workspaces.indexWhere((ws) => ws.id == workspaceId);
+    if (index == -1) return false;
+    if (_activeWorkspaceId == workspaceId) return true;
+    _activeWorkspaceId = workspaceId;
+    _changed();
+    await flush();
+    return true;
+  }
+
+  /// Валидация имени нового пространства. Возвращает sanitized ошибку
+  /// или null.
+  String? validateWorkspaceName(String rawName) {
+    final name = rawName.trim();
+    if (name.isEmpty) return 'Введите название пространства';
+    if (name.length > 40) return 'Название длиннее 40 символов';
+    final duplicate = _workspaces.any(
+      (ws) => ws.name.toLowerCase() == name.toLowerCase(),
+    );
+    if (duplicate) return 'Пространство с таким названием уже есть';
+    return null;
+  }
+
+  /// Создание пространства (валидация внутри) и переключение на него.
+  /// Возвращает sanitized ошибку или null при успехе.
+  Future<String?> createWorkspace(
+    String name, {
+    int colorValue = 0xFF9B8CFF,
+  }) async {
+    final error = validateWorkspaceName(name);
+    if (error != null) return error;
+    final cleanName = name.trim();
+    final record = WorkspaceRecord(
+      id: 'ws-${DateTime.now().microsecondsSinceEpoch}',
+      name: cleanName,
+      type: 'personal',
+      colorValue: colorValue,
+      createdAt: DateTime.now().toUtc(),
+    );
+    _workspaces.add(record);
+    _activeWorkspaceId = record.id;
+    final engine = await workspaceDataEngine();
+    if (engine != null) {
+      await engine.saveWorkspace(record);
+    }
+    _changed();
+    await flush();
+    return null;
+  }
+
+  /// Удаление пространства. Дефолт защищён; активное - с fallback на
+  /// дефолт. Данные сущностей сохраняются (пространство исчезает из
+  /// списка переключения).
+  Future<String?> deleteWorkspace(String workspaceId) async {
+    final record = _workspaces
+        .where((ws) => ws.id == workspaceId)
+        .firstOrNull;
+    if (record == null) return 'Пространство не найдено';
+    if (record.isDefault) {
+      return 'Дефолтное пространство удалить нельзя';
+    }
+    _workspaces.remove(record);
+    if (_activeWorkspaceId == workspaceId) {
+      _activeWorkspaceId = 'workspace-work';
+    }
+    final engine = await workspaceDataEngine();
+    if (engine != null) {
+      await engine.deleteWorkspace(workspaceId);
+    }
+    _changed();
+    await flush();
+    return null;
+  }
+
   // ===== MAIL-02C: on-demand тело письма + кэш =====
 
   final Map<String, CachedEmailBody> _bodyCacheInView =
@@ -1637,6 +1791,8 @@ final class OrbitAppState extends ChangeNotifier {
           credentialsReconciled = true;
         }
       }
+      // P3-01: пространства — snapshot + production SQLite склейка.
+      await _loadWorkspaces(state);
       final chatRaw = (state['brainChatHistory'] as List<Object?>? ?? const [])
           .whereType<Map<String, Object?>>()
           .map(BrainChatMessage.fromJson)
@@ -1780,6 +1936,8 @@ final class OrbitAppState extends ChangeNotifier {
       'brainChatHistory': _brainChatHistory.map((m) => m.toJson()).toList(),
       // MAIL-02B r3: контролируемый получатель (не секрет; ровно один).
       'smtpControlledRecipient': _controlledRecipient,
+      'workspaces': _workspaces.map((ws) => ws.toMap()).toList(),
+      'activeWorkspaceId': _activeWorkspaceId,
       ..._draft.toJson(),
     };
     if (!_canEdit) {

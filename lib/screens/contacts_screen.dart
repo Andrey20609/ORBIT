@@ -5,6 +5,7 @@ import 'package:go_router/go_router.dart';
 
 import '../data/database/memory_orbit_database.dart';
 import '../data/database/orbit_data_engine.dart';
+import '../data/drift_local_state_repository.dart';
 import '../data/models/contact_record.dart';
 import '../services/contacts/contacts_service.dart';
 import '../widgets/glass_panel.dart';
@@ -19,17 +20,54 @@ final class ContactsScreen extends StatefulWidget {
 }
 
 final class _ContactsScreenState extends State<ContactsScreen> {
-  late final ContactsService _contactsService;
+  ContactsService? _contactsService;
   Map<String, List<ContactRecord>> _groupedContacts = {};
   final TextEditingController _searchCtrl = TextEditingController();
   bool _isLoading = true;
 
+  OrbitDataEngine? _engine;
+  String? _loadedWorkspaceId;
+  bool _engineReady = false;
+
   @override
-  void initState() {
-    super.initState();
-    final engine = OrbitDataEngine(MemoryOrbitDatabase(autoSeed: true));
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+    if (!_engineReady) {
+      _engineReady = true;
+      unawaited(_ensureEngine());
+    } else {
+      unawaited(_syncWorkspace());
+    }
+  }
+
+  /// P3-01: движок поверх production SQLite с активным workspace;
+  /// fallback - Memory-движок (memory-репозиторий / тесты).
+  Future<void> _ensureEngine() async {
+    final state = OrbitEnvironment.of(context).appState;
+    final repo = state.repository;
+    OrbitDataEngine engine;
+    if (repo is DriftLocalStateRepository) {
+      engine = OrbitDataEngine(await repo.outboxDatabase());
+      _loadedWorkspaceId = state.activeWorkspaceId;
+      engine.setActiveWorkspace(_loadedWorkspaceId!);
+    } else {
+      engine = OrbitDataEngine(MemoryOrbitDatabase(autoSeed: true));
+      _loadedWorkspaceId = engine.activeWorkspaceId;
+    }
+    _engine = engine;
     _contactsService = ContactsService(dataEngine: engine);
-    _loadContacts();
+    await _loadContacts();
+  }
+
+  /// P3-01: смена активного пространства - перезагрузка данных.
+  Future<void> _syncWorkspace() async {
+    final engine = _engine;
+    if (engine == null) return;
+    final state = OrbitEnvironment.of(context).appState;
+    if (state.activeWorkspaceId == _loadedWorkspaceId) return;
+    engine.setActiveWorkspace(state.activeWorkspaceId);
+    _loadedWorkspaceId = state.activeWorkspaceId;
+    await _loadContacts();
   }
 
   @override
@@ -41,7 +79,7 @@ final class _ContactsScreenState extends State<ContactsScreen> {
   Future<void> _loadContacts() async {
     setState(() => _isLoading = true);
     try {
-      final grouped = await _contactsService.getContactsGroupedByLetter();
+      final grouped = await _contactsService!.getContactsGroupedByLetter();
       if (mounted) {
         setState(() {
           _groupedContacts = grouped;
@@ -172,7 +210,7 @@ final class _ContactsScreenState extends State<ContactsScreen> {
                       final email = emailCtrl.text.trim();
                       if (name.isEmpty || email.isEmpty) return;
 
-                      await _contactsService.createContact(
+                      await _contactsService!.createContact(
                         name: name,
                         email: email,
                         phone: phoneCtrl.text.trim(),
@@ -248,7 +286,7 @@ final class _ContactsScreenState extends State<ContactsScreen> {
                       if (q.isEmpty) {
                         await _loadContacts();
                       } else {
-                        final found = await _contactsService.searchContacts(q);
+                        final found = await _contactsService!.searchContacts(q);
                         final grouped = <String, List<ContactRecord>>{};
                         for (final c in found) {
                           final letter = c.name.isNotEmpty ? c.name.substring(0, 1).toUpperCase() : '#';
